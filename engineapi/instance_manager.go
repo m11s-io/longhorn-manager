@@ -37,6 +37,12 @@ const (
 	// N-replica simultaneous linked-clone via DstReplicaSrcReplicaPairMap.
 	MinProxyAPIVersionForNReplicaLinkedClone = 7
 
+	// MinProxyAPIVersionForBackupSignAcceptEncoding is the minimum proxy API version whose backup
+	// env allowlist contains AWS_SIGN_ACCEPT_ENCODING. Older proxies reject the whole backup
+	// request when the key is present, which happens on every live upgrade until the engines move
+	// to the new instance manager.
+	MinProxyAPIVersionForBackupSignAcceptEncoding = 8
+
 	DefaultEnginePortCount = 1
 
 	DefaultReplicaPortCountV1 = 10
@@ -90,7 +96,7 @@ func (c *InstanceManagerClient) Close() error {
 
 func GetDeprecatedInstanceManagerBinary(image string) string {
 	cname := types.GetImageCanonicalName(image)
-	return filepath.Join(types.GetEngineBinaryDirectoryOnHost(), cname, DeprecatedInstanceManagerBinaryName)
+	return filepath.Join(types.EngineBinaryDirectoryOnHost, cname, DeprecatedInstanceManagerBinaryName)
 }
 
 func CheckInstanceManagerCompatibility(imMinVersion, imVersion int) error {
@@ -543,6 +549,7 @@ type EngineFrontendInstanceCreateRequest struct {
 	VolumeFrontend                longhorn.VolumeFrontend
 	UblkQueueDepth                int
 	UblkNumberOfQueue             int
+	NvmeTcpNrIoQueues             int
 	TargetIP                      string
 	TargetPort                    int
 	EngineName                    string
@@ -600,6 +607,7 @@ func (c *InstanceManagerClient) EngineFrontendInstanceCreate(req *EngineFrontend
 			Frontend:          frontend,
 			UblkQueueDepth:    req.UblkQueueDepth,
 			UblkNumberOfQueue: req.UblkNumberOfQueue,
+			NvmeTcpNrIoQueues: req.NvmeTcpNrIoQueues,
 			TargetAddress:     targetAddress,
 			EngineName:        req.EngineName,
 		},

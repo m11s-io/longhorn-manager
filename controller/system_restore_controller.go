@@ -384,10 +384,15 @@ func (c *SystemRestoreController) CreateSystemRestoreJob(systemRestore *longhorn
 		return nil, err
 	}
 
-	return c.ds.CreateJob(c.newSystemRestoreJob(systemRestore, c.namespace, cfg.ManagerImage, serviceAccountName, tolerations))
+	registrySecretSetting, err := c.ds.GetSettingWithAutoFillingRO(types.SettingNameRegistrySecret)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.ds.CreateJob(c.newSystemRestoreJob(systemRestore, c.namespace, cfg.ManagerImage, serviceAccountName, registrySecretSetting.Value, tolerations))
 }
 
-func (c *SystemRestoreController) newSystemRestoreJob(systemRestore *longhorn.SystemRestore, namespace, managerImage, serviceAccount string, tolerations []corev1.Toleration) *batchv1.Job {
+func (c *SystemRestoreController) newSystemRestoreJob(systemRestore *longhorn.SystemRestore, namespace, managerImage, serviceAccount, registrySecret string, tolerations []corev1.Toleration) *batchv1.Job {
 	backoffLimit := int32(RestoreJobBackoffLimit)
 
 	// This is required for the NFS mount to access the backup store
@@ -429,19 +434,11 @@ func (c *SystemRestoreController) newSystemRestoreJob(systemRestore *longhorn.Sy
 									Name:  "NODE_NAME",
 									Value: c.controllerID,
 								},
-								{
-									Name:  types.LonghornDataPathEnv,
-									Value: types.GetLonghornDataPath(),
-								},
-								{
-									Name:  types.LonghornControlPathEnv,
-									Value: types.GetLonghornControlPath(),
-								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "engine",
-									MountPath: types.GetEngineBinaryDirectoryOnHost(),
+									MountPath: types.EngineBinaryDirectoryOnHost,
 								},
 							},
 							SecurityContext: &corev1.SecurityContext{
@@ -454,7 +451,7 @@ func (c *SystemRestoreController) newSystemRestoreJob(systemRestore *longhorn.Sy
 							Name: "engine",
 							VolumeSource: corev1.VolumeSource{
 								HostPath: &corev1.HostPathVolumeSource{
-									Path: types.GetEngineBinaryDirectoryOnHost(),
+									Path: types.EngineBinaryDirectoryOnHost,
 								},
 							},
 						},
@@ -467,6 +464,14 @@ func (c *SystemRestoreController) newSystemRestoreJob(systemRestore *longhorn.Sy
 				},
 			},
 		},
+	}
+
+	if registrySecret != "" {
+		job.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{
+				Name: registrySecret,
+			},
+		}
 	}
 
 	return job
