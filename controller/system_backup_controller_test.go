@@ -10,6 +10,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	. "gopkg.in/check.v1"
+
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -27,8 +29,6 @@ import (
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	lhfake "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned/fake"
 	lhinformers "github.com/longhorn/longhorn-manager/k8s/pkg/client/informers/externalversions"
-
-	. "gopkg.in/check.v1"
 )
 
 type SystemBackupTestCase struct {
@@ -179,6 +179,186 @@ func (s *TestSuite) TestReconcileSystemBackup(c *C) {
 			},
 			expectState:               longhorn.SystemBackupStateBackingImageBackup,
 			expectNewVolumBackupCount: 1,
+		},
+		"system backup create volume backup if-not-present when an older snapshot has no new data": {
+			state:              longhorn.SystemBackupStateVolumeBackup,
+			volumeBackupPolicy: longhorn.SystemBackupCreateVolumeBackupPolicyIfNotPresent,
+			existVolumes: map[SystemRolloutCRName]*longhorn.Volume{
+				SystemRolloutCRName(TestVolumeName): {
+					Status: longhorn.VolumeStatus{
+						LastBackup: "exists",
+					},
+				},
+			},
+			existBackups: map[string]*longhorn.Backup{
+				"exists": {
+					Status: longhorn.BackupStatus{
+						State:        longhorn.BackupStateCompleted,
+						SnapshotName: "exists",
+						VolumeName:   TestVolumeName,
+					},
+				},
+			},
+			existSnapshots: map[string]*longhorn.Snapshot{
+				"exists": {
+					ObjectMeta: metav1.ObjectMeta{Name: "exists"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.Now().Format(time.RFC3339),
+					},
+				},
+				"older": {
+					ObjectMeta: metav1.ObjectMeta{Name: "older"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.NewTime(time.Now().Add(-time.Hour)).Format(time.RFC3339),
+					},
+				},
+			},
+			expectState:               longhorn.SystemBackupStateBackingImageBackup,
+			expectNewVolumBackupCount: 0,
+		},
+		"system backup create volume backup if-not-present when a snapshot outside the last backup chain has no creationTime": {
+			state:              longhorn.SystemBackupStateVolumeBackup,
+			volumeBackupPolicy: longhorn.SystemBackupCreateVolumeBackupPolicyIfNotPresent,
+			existVolumes: map[SystemRolloutCRName]*longhorn.Volume{
+				SystemRolloutCRName(TestVolumeName): {
+					Status: longhorn.VolumeStatus{
+						LastBackup: "exists",
+					},
+				},
+			},
+			existBackups: map[string]*longhorn.Backup{
+				"exists": {
+					Status: longhorn.BackupStatus{
+						State:        longhorn.BackupStateCompleted,
+						SnapshotName: "exists",
+						VolumeName:   TestVolumeName,
+					},
+				},
+			},
+			existSnapshots: map[string]*longhorn.Snapshot{
+				"exists": {
+					ObjectMeta: metav1.ObjectMeta{Name: "exists"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.Now().Format(time.RFC3339),
+					},
+				},
+				"leftover": {
+					ObjectMeta: metav1.ObjectMeta{Name: "leftover"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse: true,
+						Size:       1,
+						// CreationTime is not set
+					},
+				},
+			},
+			expectState:               longhorn.SystemBackupStateBackingImageBackup,
+			expectNewVolumBackupCount: 1,
+		},
+		"system backup skip volume backup if-not-present when only an ancestor of the last backup snapshot has no creationTime": {
+			state:              longhorn.SystemBackupStateVolumeBackup,
+			volumeBackupPolicy: longhorn.SystemBackupCreateVolumeBackupPolicyIfNotPresent,
+			existVolumes: map[SystemRolloutCRName]*longhorn.Volume{
+				SystemRolloutCRName(TestVolumeName): {
+					Status: longhorn.VolumeStatus{
+						LastBackup: "exists",
+					},
+				},
+			},
+			existBackups: map[string]*longhorn.Backup{
+				"exists": {
+					Status: longhorn.BackupStatus{
+						State:        longhorn.BackupStateCompleted,
+						SnapshotName: "exists",
+						VolumeName:   TestVolumeName,
+					},
+				},
+			},
+			existSnapshots: map[string]*longhorn.Snapshot{
+				"exists": {
+					ObjectMeta: metav1.ObjectMeta{Name: "exists"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						Parent:       "restored",
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.Now().Format(time.RFC3339),
+					},
+				},
+				"restored": {
+					ObjectMeta: metav1.ObjectMeta{Name: "restored"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse: true,
+						Size:       1,
+						// CreationTime is not set, as for the first snapshot of a restored or cloned V1 volume
+					},
+				},
+			},
+			expectState:               longhorn.SystemBackupStateBackingImageBackup,
+			expectNewVolumBackupCount: 0,
+		},
+		"system backup skip volume backup if-not-present when an ancestor two snapshots up the chain has no creationTime": {
+			state:              longhorn.SystemBackupStateVolumeBackup,
+			volumeBackupPolicy: longhorn.SystemBackupCreateVolumeBackupPolicyIfNotPresent,
+			existVolumes: map[SystemRolloutCRName]*longhorn.Volume{
+				SystemRolloutCRName(TestVolumeName): {
+					Status: longhorn.VolumeStatus{
+						LastBackup: "exists",
+					},
+				},
+			},
+			existBackups: map[string]*longhorn.Backup{
+				"exists": {
+					Status: longhorn.BackupStatus{
+						State:        longhorn.BackupStateCompleted,
+						SnapshotName: "exists",
+						VolumeName:   TestVolumeName,
+					},
+				},
+			},
+			existSnapshots: map[string]*longhorn.Snapshot{
+				"exists": {
+					ObjectMeta: metav1.ObjectMeta{Name: "exists"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						Parent:       "middle",
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.Now().Format(time.RFC3339),
+					},
+				},
+				"middle": {
+					ObjectMeta: metav1.ObjectMeta{Name: "middle"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						Parent:       "restored",
+						ReadyToUse:   true,
+						Size:         1,
+						CreationTime: metav1.NewTime(time.Now().Add(-time.Hour)).Format(time.RFC3339),
+					},
+				},
+				"restored": {
+					ObjectMeta: metav1.ObjectMeta{Name: "restored"},
+					Spec:       longhorn.SnapshotSpec{Volume: TestVolumeName},
+					Status: longhorn.SnapshotStatus{
+						ReadyToUse: true,
+						Size:       1,
+						// CreationTime is not set
+					},
+				},
+			},
+			expectState:               longhorn.SystemBackupStateBackingImageBackup,
+			expectNewVolumBackupCount: 0,
 		},
 		"system backup create volume backup always": {
 			state:              longhorn.SystemBackupStateVolumeBackup,
@@ -361,7 +541,12 @@ func (s *TestSuite) TestReconcileSystemBackup(c *C) {
 					fakeSystemRolloutSnapshot(existBackupSnap, c, informerFactories.LhInformerFactory, lhClient)
 				}
 			}
-			backups, _ := systemBackupController.BackupVolumes(systemBackup)
+			backups, err := systemBackupController.BackupVolumes(systemBackup)
+			if tc.expectError {
+				c.Assert(err, NotNil)
+			} else {
+				c.Assert(err, IsNil)
+			}
 
 			for _, backup := range backups {
 				backup.Status.State = longhorn.BackupStateCompleted
@@ -430,7 +615,7 @@ func (s *TestSuite) TestReconcileSystemBackup(c *C) {
 
 func newFakeSystemBackupController(lhClient *lhfake.Clientset, kubeClient *fake.Clientset, extensionsClient *apiextensionsfake.Clientset,
 	informerFactories *util.InformerFactories, controllerID string) (*SystemBackupController, error) {
-	ds := datastore.NewDataStore(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
+	ds := datastore.NewDataStoreForGlobal(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
 
 	logger := logrus.StandardLogger()
 	logrus.SetLevel(logrus.DebugLevel)

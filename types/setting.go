@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"slices"
 	"strconv"
@@ -80,7 +81,6 @@ const (
 	SettingNameAllowRecurringJobWhileVolumeDetached                     = SettingName("allow-recurring-job-while-volume-detached")
 	SettingNameCreateDefaultDiskLabeledNodes                            = SettingName("create-default-disk-labeled-nodes")
 	SettingNameDefaultDataPath                                          = SettingName("default-data-path")
-	SettingNameDefaultControlPath                                       = SettingName("default-control-path")
 	SettingNameDefaultEngineImage                                       = SettingName("default-engine-image")
 	SettingNameDefaultInstanceManagerImage                              = SettingName("default-instance-manager-image")
 	SettingNameDefaultBackingImageManagerImage                          = SettingName("default-backing-image-manager-image")
@@ -105,6 +105,7 @@ const (
 	SettingNameTaintToleration                                          = SettingName("taint-toleration")
 	SettingNameSystemManagedComponentsNodeSelector                      = SettingName("system-managed-components-node-selector")
 	SettingNameSystemManagedCSIComponentsResourceLimits                 = SettingName("system-managed-csi-components-resource-limits")
+	SettingNameSystemManagedComponentsPriorityClasses                   = SettingName("system-managed-components-priority-classes")
 	SettingNameCRDAPIVersion                                            = SettingName("crd-api-version")
 	SettingNameAutoSalvage                                              = SettingName("auto-salvage")
 	SettingNameAutoDeletePodWhenVolumeDetachedUnexpectedly              = SettingName("auto-delete-pod-when-volume-detached-unexpectedly")
@@ -183,12 +184,16 @@ const (
 	SettingNameOfflineReplicaRebuilding                                 = SettingName("offline-replica-rebuilding")
 	SettingNameReplicaRebuildingBandwidthLimit                          = SettingName("replica-rebuilding-bandwidth-limit")
 	SettingNameDefaultUblkQueueDepth                                    = SettingName("default-ublk-queue-depth")
+	SettingNameDefaultNvmeTcpNrIoQueues                                 = SettingName("default-nvme-tcp-nr-io-queues")
 	SettingNameDefaultUblkNumberOfQueue                                 = SettingName("default-ublk-number-of-queue")
 	SettingNameDefaultBackupBlockSize                                   = SettingName("default-backup-block-size")
 	SettingNameEngineImagePodLivenessProbePeriod                        = SettingName("engine-image-pod-liveness-probe-period")
 	SettingNameEngineImagePodLivenessProbeTimeout                       = SettingName("engine-image-pod-liveness-probe-timeout")
 	SettingNameEngineImagePodLivenessProbeFailureThreshold              = SettingName("engine-image-pod-liveness-probe-failure-threshold")
 	SettingNameInstanceManagerPodLivenessProbeTimeout                   = SettingName("instance-manager-pod-liveness-probe-timeout")
+	SettingNameAllowInstanceManagerAutomaticUpgrade                     = SettingName("allow-instance-manager-automatic-upgrade")
+	SettingNameInstanceManagerUpgradeStartTime                          = SettingName("instance-manager-upgrade-start-time")
+	SettingNameInstanceManagerUpgradeTimeout                            = SettingName("instance-manager-upgrade-timeout")
 	SettingNameLogPath                                                  = SettingName("log-path")
 	SettingNameSnapshotHeavyTaskConcurrentLimit                         = SettingName("snapshot-heavy-task-concurrent-limit")
 	SettingNameNodeDiskHealthMonitoring                                 = SettingName("node-disk-health-monitoring")
@@ -213,7 +218,6 @@ var (
 		SettingNameAllowRecurringJobWhileVolumeDetached,
 		SettingNameCreateDefaultDiskLabeledNodes,
 		SettingNameDefaultDataPath,
-		SettingNameDefaultControlPath,
 		SettingNameDefaultEngineImage,
 		SettingNameDefaultInstanceManagerImage,
 		SettingNameDefaultBackingImageManagerImage,
@@ -238,6 +242,7 @@ var (
 		SettingNameTaintToleration,
 		SettingNameSystemManagedComponentsNodeSelector,
 		SettingNameSystemManagedCSIComponentsResourceLimits,
+		SettingNameSystemManagedComponentsPriorityClasses,
 		SettingNameCRDAPIVersion,
 		SettingNameAutoSalvage,
 		SettingNameAutoDeletePodWhenVolumeDetachedUnexpectedly,
@@ -316,12 +321,16 @@ var (
 		SettingNameOfflineReplicaRebuilding,
 		SettingNameReplicaRebuildingBandwidthLimit,
 		SettingNameDefaultUblkQueueDepth,
+		SettingNameDefaultNvmeTcpNrIoQueues,
 		SettingNameDefaultUblkNumberOfQueue,
 		SettingNameDefaultBackupBlockSize,
 		SettingNameEngineImagePodLivenessProbePeriod,
 		SettingNameEngineImagePodLivenessProbeTimeout,
 		SettingNameEngineImagePodLivenessProbeFailureThreshold,
 		SettingNameInstanceManagerPodLivenessProbeTimeout,
+		SettingNameAllowInstanceManagerAutomaticUpgrade,
+		SettingNameInstanceManagerUpgradeStartTime,
+		SettingNameInstanceManagerUpgradeTimeout,
 		SettingNameLogPath,
 		SettingNameNodeDiskHealthMonitoring,
 		SettingNameSnapshotHeavyTaskConcurrentLimit,
@@ -348,6 +357,7 @@ type SettingCategory string
 const (
 	SettingCategorySystemInfo = SettingCategory("system info")
 	SettingCategoryGeneral    = SettingCategory("general")
+	SettingCategoryUpgrade    = SettingCategory("upgrade")
 	SettingCategoryBackup     = SettingCategory("backup")
 	SettingCategoryOrphan     = SettingCategory("orphan")
 	SettingCategoryScheduling = SettingCategory("scheduling")
@@ -381,7 +391,6 @@ var (
 		SettingNameAllowRecurringJobWhileVolumeDetached:                     SettingDefinitionAllowRecurringJobWhileVolumeDetached,
 		SettingNameCreateDefaultDiskLabeledNodes:                            SettingDefinitionCreateDefaultDiskLabeledNodes,
 		SettingNameDefaultDataPath:                                          SettingDefinitionDefaultDataPath,
-		SettingNameDefaultControlPath:                                       SettingDefinitionDefaultControlPath,
 		SettingNameDefaultEngineImage:                                       SettingDefinitionDefaultEngineImage,
 		SettingNameDefaultInstanceManagerImage:                              SettingDefinitionDefaultInstanceManagerImage,
 		SettingNameDefaultBackingImageManagerImage:                          SettingDefinitionDefaultBackingImageManagerImage,
@@ -406,6 +415,7 @@ var (
 		SettingNameTaintToleration:                                          SettingDefinitionTaintToleration,
 		SettingNameSystemManagedComponentsNodeSelector:                      SettingDefinitionSystemManagedComponentsNodeSelector,
 		SettingNameSystemManagedCSIComponentsResourceLimits:                 SettingDefinitionSystemManagedCSIComponentsResourceLimits,
+		SettingNameSystemManagedComponentsPriorityClasses:                   SettingDefinitionSystemManagedComponentsPriorityClasses,
 		SettingNameCRDAPIVersion:                                            SettingDefinitionCRDAPIVersion,
 		SettingNameAutoSalvage:                                              SettingDefinitionAutoSalvage,
 		SettingNameAutoDeletePodWhenVolumeDetachedUnexpectedly:              SettingDefinitionAutoDeletePodWhenVolumeDetachedUnexpectedly,
@@ -483,18 +493,21 @@ var (
 		SettingNameOfflineReplicaRebuilding:                                 SettingDefinitionOfflineReplicaRebuilding,
 		SettingNameReplicaRebuildingBandwidthLimit:                          SettingDefinitionReplicaRebuildingBandwidthLimit,
 		SettingNameDefaultUblkQueueDepth:                                    SettingDefinitionDefaultUblkQueueDepth,
+		SettingNameDefaultNvmeTcpNrIoQueues:                                 SettingDefinitionDefaultNvmeTcpNrIoQueues,
 		SettingNameDefaultUblkNumberOfQueue:                                 SettingDefinitionDefaultUblkNumberOfQueue,
 		SettingNameDefaultBackupBlockSize:                                   SettingDefinitionDefaultBackupBlockSize,
 		SettingNameEngineImagePodLivenessProbePeriod:                        SettingDefinitionEngineImagePodLivenessProbePeriod,
 		SettingNameEngineImagePodLivenessProbeTimeout:                       SettingDefinitionEngineImagePodLivenessProbeTimeout,
 		SettingNameEngineImagePodLivenessProbeFailureThreshold:              SettingDefinitionEngineImagePodLivenessProbeFailureThreshold,
 		SettingNameInstanceManagerPodLivenessProbeTimeout:                   SettingDefinitionInstanceManagerPodLivenessProbeTimeout,
-		SettingNameLogPath:                                                  SettingDefinitionLogPath,
-		SettingNameNodeDiskHealthMonitoring:                                 SettingDefinitionNodeDiskHealthMonitoring,
-		SettingNameSnapshotHeavyTaskConcurrentLimit:                         SettingDefinitionSnapshotHeavyTaskConcurrentLimit,
-		SettingNameCSIAllowedTopologyKeys:                                   SettingDefinitionCSIAllowedTopologyKeys,
-		SettingNameCSIStorageCapacityTracking:                               SettingDefinitionCSIStorageCapacityTracking,
-		SettingNameAllowLiveEngineUpgradeOnSameImageCommit:                  SettingDefinitionAllowLiveEngineUpgradeOnSameImageCommit,
+		SettingNameAllowInstanceManagerAutomaticUpgrade:                     SettingDefinitionAllowInstanceManagerAutomaticUpgrade,
+		SettingNameInstanceManagerUpgradeStartTime:                          SettingDefinitionInstanceManagerUpgradeStartTime,
+		SettingNameInstanceManagerUpgradeTimeout:                            SettingDefinitionInstanceManagerUpgradeTimeout, SettingNameLogPath: SettingDefinitionLogPath,
+		SettingNameNodeDiskHealthMonitoring:                SettingDefinitionNodeDiskHealthMonitoring,
+		SettingNameSnapshotHeavyTaskConcurrentLimit:        SettingDefinitionSnapshotHeavyTaskConcurrentLimit,
+		SettingNameCSIAllowedTopologyKeys:                  SettingDefinitionCSIAllowedTopologyKeys,
+		SettingNameCSIStorageCapacityTracking:              SettingDefinitionCSIStorageCapacityTracking,
+		SettingNameAllowLiveEngineUpgradeOnSameImageCommit: SettingDefinitionAllowLiveEngineUpgradeOnSameImageCommit,
 	}
 
 	SettingDefinitionAllowRecurringJobWhileVolumeDetached = SettingDefinition{
@@ -571,34 +584,14 @@ var (
 	}
 
 	SettingDefinitionDefaultDataPath = SettingDefinition{
-		DisplayName: "Default Data Path",
-		Description: "Default path to use for storing data on a host. " +
-			"An absolute directory path indicates a filesystem-type disk used by the V1 Data Engine, " +
-			"whereas a path to a block device indicates a block-type disk used by the V2 Data Engine. " +
-			"Bare PCI identifiers (such as '0000:00:1e.0') are not supported here since this setting may be " +
-			"used as a host path for pod mounts. " +
-			"When this setting is a block device path, runtime and control-plane paths are configured " +
-			"separately via the 'default-control-path' setting. Note: This is an installation-time setting " +
-			"and cannot be changed after Longhorn is initialized.",
+		DisplayName:        "Default Data Path",
+		Description:        "Default path to use for storing data on a host. An absolute directory path indicates a filesystem-type disk used by the V1 Data Engine, while a path to a block device indicates a block-type disk used by the V2 Data Engine.",
 		Category:           SettingCategoryGeneral,
 		Type:               SettingTypeString,
 		Required:           true,
 		ReadOnly:           false,
 		DataEngineSpecific: false,
-		Default:            DefaultDataPath,
-	}
-
-	SettingDefinitionDefaultControlPath = SettingDefinition{
-		DisplayName: "Default Control Path",
-		Description: "Default path used for storing runtime and control-plane artifacts on a host. " +
-			"This setting must be an absolute directory path. Engine binaries, metadata, sockets, and logs " +
-			"are stored under this path for both V1 and V2 engines. Note: This is an installation-time " +
-			"setting and cannot be changed after Longhorn is initialized.",
-		Type:               SettingTypeString,
-		Required:           true,
-		ReadOnly:           false,
-		DataEngineSpecific: false,
-		Default:            DefaultControlPath,
+		Default:            "/var/lib/longhorn/",
 	}
 
 	SettingDefinitionDefaultEngineImage = SettingDefinition{
@@ -963,6 +956,33 @@ var (
 			"}\n" +
 			"```\n\n" +
 			"Supported components: csi-attacher, csi-provisioner, csi-resizer, csi-snapshotter, longhorn-csi-plugin, node-driver-registrar, longhorn-liveness-probe",
+		Category:           SettingCategoryDangerZone,
+		Type:               SettingTypeString,
+		Required:           false,
+		ReadOnly:           false,
+		DataEngineSpecific: false,
+	}
+
+	SettingDefinitionSystemManagedComponentsPriorityClasses = SettingDefinition{
+		DisplayName: "System Managed Components Priority Classes",
+		Description: "This setting allows you to configure PriorityClass overrides for system-managed components. " +
+			"Supported components include: instance-manager, engine-image, longhorn-csi-plugin, csi-attacher, csi-provisioner, csi-resizer, and csi-snapshotter. " +
+			"The value must be a JSON object with component names as keys and PriorityClass names as values. Only the components defined in the JSON object will have their " +
+			"PriorityClass overridden; all others will continue using the priority-class setting. " +
+			"WARNING: DO NOT CHANGE THIS SETTING WITH ATTACHED VOLUMES.\n\n" +
+			"Example:\n\n" +
+			"```json\n" +
+			"{\n" +
+			"  \"instance-manager\": \"system-node-critical\",\n" +
+			"  \"engine-image\": \"system-node-critical\",\n" +
+			"  \"longhorn-csi-plugin\": \"system-node-critical\",\n" +
+			"  \"csi-attacher\": \"system-cluster-critical\",\n" +
+			"  \"csi-provisioner\": \"system-cluster-critical\",\n" +
+			"  \"csi-resizer\": \"system-cluster-critical\",\n" +
+			"  \"csi-snapshotter\": \"system-cluster-critical\"\n" +
+			"}\n" +
+			"```\n\n" +
+			"Supported components: instance-manager, engine-image, longhorn-csi-plugin, csi-attacher, csi-provisioner, csi-resizer, csi-snapshotter",
 		Category:           SettingCategoryDangerZone,
 		Type:               SettingTypeString,
 		Required:           false,
@@ -1778,6 +1798,56 @@ var (
 		},
 	}
 
+	SettingDefinitionAllowInstanceManagerAutomaticUpgrade = SettingDefinition{
+		DisplayName: "Allow Instance Manager Automatic Upgrade",
+		Description: "This setting allows Longhorn to automatically upgrade instance managers after Longhorn manager is upgraded. " +
+			"During the live upgrade, Longhorn may temporarily relocate engines, detach replicas from engines, and trigger replica rebuilding. " +
+			"When disabled, Longhorn does not automatically upgrade instance managers, and existing instance managers remain on the current image. " +
+			"If this setting is disabled while an automatic instance manager upgrade is in progress, Longhorn allows the current node upgrade to finish but does not start upgrades on additional nodes. " +
+			"This setting currently only supports the V2 Data Engine.",
+		Category:           SettingCategoryUpgrade,
+		Type:               SettingTypeBool,
+		Required:           true,
+		ReadOnly:           false,
+		DataEngineSpecific: true,
+		Default:            fmt.Sprintf("{%q:\"false\"}", longhorn.DataEngineTypeV2),
+	}
+
+	SettingDefinitionInstanceManagerUpgradeStartTime = SettingDefinition{
+		DisplayName: "Instance Manager Upgrade Start Time",
+		Description: "Specifies when the rolling upgrade of instance managers should begin, in RFC3339 format. " +
+			"This setting allows the upgrade to be scheduled at a preferred time. If empty, the upgrade starts immediately. " +
+			"Updates to this setting are rejected while an upgrade is in progress. " +
+			"This setting currently only applies to the V2 Data Engine.\n\n" +
+			"Example: 2026-04-20T15:00:00Z",
+		Category:           SettingCategoryUpgrade,
+		Type:               SettingTypeString,
+		Required:           false,
+		ReadOnly:           false,
+		DataEngineSpecific: true,
+		Default:            fmt.Sprintf(`{%q:""}`, longhorn.DataEngineTypeV2),
+	}
+
+	SettingDefinitionInstanceManagerUpgradeTimeout = SettingDefinition{
+		DisplayName: "Instance Manager Upgrade Timeout",
+		Description: "In minutes. The instance manager is upgraded one node at a time, so an unexpected issue on one node could block upgrades on the remaining nodes. " +
+			"This timeout specifies how long a single-node upgrade can remain in the upgrade phases before it is aborted, allowing the upgrade process to continue with other nodes. " +
+			"It applies while the upgrade is pending, relocating engines, waiting for the source instance manager, or restoring engines, but does not apply while waiting for post-restore volume health. " +
+			"The default value is 60 minutes. " +
+			"This setting currently only applies to the V2 Data Engine.\n\n" +
+			"Important: Changes to this setting take effect immediately and apply to all in-flight upgrade operations. " +
+			"Increasing the timeout gives struggling upgrades more time to complete; decreasing it may cause currently running upgrades to abort if they exceed the new timeout.\n\n",
+		Category:           SettingCategoryUpgrade,
+		Type:               SettingTypeInt,
+		Required:           true,
+		ReadOnly:           false,
+		DataEngineSpecific: true,
+		Default:            fmt.Sprintf(`{%q:"60"}`, longhorn.DataEngineTypeV2),
+		ValueIntRange: map[string]int{
+			ValueIntRangeMinimum: 1,
+		},
+	}
+
 	SettingDefinitionLogLevel = SettingDefinition{
 		DisplayName:        "Log Level",
 		Description:        "The log level Panic, Fatal, Error, Warn, Info, Debug, Trace used in longhorn manager. By default Info.",
@@ -1917,7 +1987,9 @@ var (
 			"This setting is applicable only when the V2 Data Engine is enabled. \n\n" +
 			"  - DO NOT CHANGE THIS SETTING WITH ATTACHED VOLUMES. Longhorn will block this setting update when there are attached V2 volumes. \n\n" +
 			"  - `true`: Enables interrupt mode, which may reduce CPU usage. \n\n" +
-			"  - `false`: Uses polling mode for maximum performance. \n\n",
+			"  - `false`: Uses polling mode for maximum performance. \n\n" +
+			"  - When interrupt mode is enabled, **Enable Host CPU Isolation for Data Engine** is always disabled, because the SPDK reactors no longer busy-poll and do not need to be protected from host interrupt handling, deferred kernel work, or network softirq processing. " +
+			"This applies regardless of the **Enable Host CPU Isolation for Data Engine** value and of any per-Instance-Manager override. \n\n",
 		Category:           SettingCategoryDangerZone,
 		Type:               SettingTypeBool,
 		Required:           true,
@@ -1930,15 +2002,17 @@ var (
 		DisplayName: "Enable Host CPU Isolation for Data Engine",
 		Description: "Applies only to the V2 Data Engine. Steers host hardware IRQs, unbound kernel workqueue workers, *and* network Receive Packet Steering (RPS) away from the CPUs used by the Storage Performance Development Kit (SPDK) target daemon, " +
 			"so that interrupt handling, deferred kernel work, and network softirq processing do not preempt SPDK polling reactors. \n\n" +
+			"  - This setting only takes effect in polling mode. When **Enable Interrupt Mode for Data Engine** is enabled, CPU isolation is always disabled, regardless of this setting and of any per-Instance-Manager override. \n\n" +
+			"  - In polling mode, CPU isolation is enabled whenever this setting is `true`. \n\n" +
 			"  - When applying the setting, Longhorn will try to restart all V2 instance-manager pods if all volumes are detached and eventually restart the instance manager pod without instances running on the instance manager. \n\n" +
-			"  - This value can be overridden per Instance Manager via `Spec.DataEngineSpec.V2.CPUIsolationEnabled` " +
+			"  - In polling mode, this value can be overridden per Instance Manager via `Spec.DataEngineSpec.V2.CPUIsolationEnabled` " +
 			"(set to `\"true\"` or `\"false\"` on a specific instance manager to force the value on that node; leave empty to inherit this setting). \n\n",
 		Category:           SettingCategoryDangerZone,
 		Type:               SettingTypeBool,
 		Required:           true,
 		ReadOnly:           false,
 		DataEngineSpecific: true,
-		Default:            fmt.Sprintf("{%q:\"false\"}", longhorn.DataEngineTypeV2),
+		Default:            fmt.Sprintf("{%q:\"true\"}", longhorn.DataEngineTypeV2),
 	}
 
 	SettingDefinitionReplicaDiskSoftAntiAffinity = SettingDefinition{
@@ -2019,6 +2093,21 @@ var (
 		ReadOnly:           false,
 		DataEngineSpecific: true,
 		Default:            fmt.Sprintf("{%q:\"0\"}", longhorn.DataEngineTypeV2),
+	}
+
+	SettingDefinitionDefaultNvmeTcpNrIoQueues = SettingDefinition{
+		DisplayName:        "Default NVMe-TCP Number Of IO Queues",
+		Description:        "The default number of I/O queues the kernel initiator creates when connecting a volume frontend over NVMe-TCP. This caps the per-volume in-flight commands to the number of I/O queues multiplied by the negotiated queue size (128). This setting applies to volumes using the V2 Data Engine with the block device front end, takes effect on (re)attach, and can be overridden per volume. 0 means unspecified (kernel default, one queue per online core).",
+		Category:           SettingCategoryGeneral,
+		Type:               SettingTypeInt,
+		Required:           true,
+		ReadOnly:           false,
+		DataEngineSpecific: true,
+		Default:            fmt.Sprintf("{%q:\"0\"}", longhorn.DataEngineTypeV2),
+		ValueIntRange: map[string]int{
+			ValueIntRangeMinimum: 0,
+			ValueIntRangeMaximum: 128,
+		},
 	}
 
 	SettingDefinitionDefaultUblkQueueDepth = SettingDefinition{
@@ -2119,7 +2208,7 @@ var (
 		Required:           true,
 		ReadOnly:           false,
 		DataEngineSpecific: false,
-		Default:            GetDefaultLogDirectoryOnHost(),
+		Default:            DefaultLogDirectoryOnHost,
 	}
 
 	SettingDefinitionNodeDiskHealthMonitoring = SettingDefinition{
@@ -2440,6 +2529,41 @@ type ComponentResourceLimits struct {
 	CSILivenessProbe       *corev1.ResourceRequirements `json:"longhorn-liveness-probe,omitempty"`
 }
 
+type ComponentPriorityClasses struct {
+	InstanceManager string `json:"instance-manager,omitempty"`
+	EngineImage     string `json:"engine-image,omitempty"`
+	CSIPlugin       string `json:"longhorn-csi-plugin,omitempty"`
+	CSIAttacher     string `json:"csi-attacher,omitempty"`
+	CSIProvisioner  string `json:"csi-provisioner,omitempty"`
+	CSIResizer      string `json:"csi-resizer,omitempty"`
+	CSISnapshotter  string `json:"csi-snapshotter,omitempty"`
+}
+
+func (priorityClasses *ComponentPriorityClasses) Get(component string) string {
+	if priorityClasses == nil {
+		return ""
+	}
+
+	switch component {
+	case SystemManagedComponentInstanceManager:
+		return priorityClasses.InstanceManager
+	case SystemManagedComponentEngineImage:
+		return priorityClasses.EngineImage
+	case CSIPluginName:
+		return priorityClasses.CSIPlugin
+	case CSIAttacherName:
+		return priorityClasses.CSIAttacher
+	case CSIProvisionerName:
+		return priorityClasses.CSIProvisioner
+	case CSIResizerName:
+		return priorityClasses.CSIResizer
+	case CSISnapshotterName:
+		return priorityClasses.CSISnapshotter
+	default:
+		return ""
+	}
+}
+
 func UnmarshalCSIComponentResourceLimits(resourceLimitsSetting string) (*ComponentResourceLimits, error) {
 	resourceLimitsSetting = strings.Trim(resourceLimitsSetting, " ")
 	if resourceLimitsSetting == "" {
@@ -2453,6 +2577,45 @@ func UnmarshalCSIComponentResourceLimits(resourceLimitsSetting string) (*Compone
 	}
 
 	return &limits, nil
+}
+
+func UnmarshalComponentPriorityClasses(priorityClassesSetting string) (*ComponentPriorityClasses, error) {
+	priorityClassesSetting = strings.Trim(priorityClassesSetting, " ")
+	if priorityClassesSetting == "" {
+		return &ComponentPriorityClasses{}, nil
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(priorityClassesSetting))
+	decoder.DisallowUnknownFields()
+
+	var priorityClasses *ComponentPriorityClasses
+	if err := decoder.Decode(&priorityClasses); err != nil {
+		return nil, errors.Wrapf(err, "failed to unmarshal system managed components priority classes %v", priorityClassesSetting)
+	}
+	if priorityClasses == nil {
+		return nil, errors.Errorf("failed to unmarshal system managed components priority classes %v: must be a JSON object", priorityClassesSetting)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.Errorf("failed to unmarshal system managed components priority classes %v: contains multiple JSON values", priorityClassesSetting)
+		}
+		return nil, errors.Wrapf(err, "failed to unmarshal system managed components priority classes %v", priorityClassesSetting)
+	}
+
+	return priorityClasses, nil
+}
+
+func ResolveSystemManagedComponentPriorityClass(defaultPriorityClass, priorityClassesSetting, component string) (string, error) {
+	priorityClasses, err := UnmarshalComponentPriorityClasses(priorityClassesSetting)
+	if err != nil {
+		return "", err
+	}
+	if priorityClass := priorityClasses.Get(component); priorityClass != "" {
+		return priorityClass, nil
+	}
+
+	return defaultPriorityClass, nil
 }
 
 func UnmarshalOrphanResourceTypes(resourceTypesSetting string) (map[OrphanResourceType]bool, error) {
@@ -2973,14 +3136,6 @@ func validateSettingString(name SettingName, definition SettingDefinition, value
 		case SettingNameDataEngineCPUMask:
 			if _, err := NormalizeCPUMask(strValue); err != nil {
 				return errors.Wrapf(err, "the value of %v is invalid", name)
-			}
-		case SettingNameDefaultDataPath:
-			if !IsValidLonghornDataPath(strValue) {
-				return fmt.Errorf("the value of %v is invalid", name)
-			}
-		case SettingNameDefaultControlPath:
-			if !IsValidLonghornControlPath(strValue) {
-				return fmt.Errorf("the value of %v is invalid", name)
 			}
 		}
 	}

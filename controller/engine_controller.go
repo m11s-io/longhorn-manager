@@ -31,6 +31,8 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/longhorn/backupstore"
+
 	lhtypes "github.com/longhorn/go-common-libs/types"
 	etypes "github.com/longhorn/longhorn-engine/pkg/types"
 	imapi "github.com/longhorn/longhorn-instance-manager/pkg/api"
@@ -98,6 +100,9 @@ type EngineController struct {
 	engines            engineapi.EngineClientCollection
 	engineMonitorMutex *sync.RWMutex
 	engineMonitorMap   map[string]chan struct{}
+
+	rebuildingEngines      map[string]bool // key: <engineName>
+	rebuildingEnginesMutex *sync.RWMutex
 
 	proxyConnCounter util.Counter
 
@@ -169,6 +174,9 @@ func NewEngineController(
 		engineMonitorMutex: &sync.RWMutex{},
 		engineMonitorMap:   map[string]chan struct{}{},
 
+		rebuildingEnginesMutex: &sync.RWMutex{},
+		rebuildingEngines:      map[string]bool{},
+
 		proxyConnCounter:      proxyConnCounter,
 		restoringCounter:      util.NewAtomicCounter(),
 		restoringCounterMutex: &sync.Mutex{},
@@ -210,6 +218,7 @@ func (ec *EngineController) Run(workers int, stopCh <-chan struct{}) {
 		return
 	}
 
+	ec.initReconcileMetrics(workers)
 	for i := 0; i < workers; i++ {
 		go wait.Until(ec.worker, time.Second, stopCh)
 	}
@@ -230,7 +239,7 @@ func (ec *EngineController) processNextWorkItem() bool {
 	}
 	defer ec.queue.Done(key)
 
-	err := ec.syncEngine(key.(string))
+	err := ec.syncWithMetrics(func() error { return ec.syncEngine(key.(string)) })
 	ec.handleErr(err, key)
 
 	return true
@@ -1696,9 +1705,79 @@ func preRestoreCheckAndSync(log logrus.FieldLogger, engine *longhorn.Engine,
 		return false, fmt.Errorf("backup volume is empty for backup restoration of engine %v", engine.Name)
 	}
 
+	if needRestore, err := checkLinkedCloneBeforeRestoration(log, engine, ds); err != nil || !needRestore {
+		return needRestore, err
+	}
+
 	if (types.IsDataEngineV1(engine.Spec.DataEngine) && cliAPIVersion >= engineapi.CLIAPIMinVersionForExistingEngineBeforeUpgrade) ||
 		types.IsDataEngineV2(engine.Spec.DataEngine) {
 		return checkSizeBeforeRestoration(log, engine, ds)
+	}
+
+	return true, nil
+}
+
+// checkLinkedCloneBeforeRestoration holds a linked-clone restore back until the volume
+// is actually ready to receive data.
+//
+// A volume restored from a linked-clone backup inherits most of its content from a
+// source snapshot; the backup only carries what the clone wrote itself. The link to
+// that source is established by the ordinary cloning flow, so the restore has to wait
+// for cloning to finish, and for its own attachment ticket to be satisfied, before any
+// data is written.
+//
+// Waiting here rather than letting the data plane reject the request matters: a
+// rejected restore is reported back as a restore error, which the caller records in
+// the restore status and backs off on, turning a normal "not ready yet" into a failure.
+func checkLinkedCloneBeforeRestoration(log logrus.FieldLogger, engine *longhorn.Engine, ds *datastore.DataStore) (bool, error) {
+	volume, err := ds.GetVolumeRO(engine.Spec.VolumeName)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get volume %v for backup restoration of engine %v", engine.Spec.VolumeName, engine.Name)
+	}
+	if volume.Spec.CloneMode != longhorn.CloneModeLinkedClone {
+		return true, nil
+	}
+
+	// A failed clone is retried up to maxCloneRetry times by shouldInitVolumeClone, so
+	// only an exhausted one is terminal. Reporting the failure earlier would abort a
+	// restore that is about to recover on its own; waiting on an exhausted one would
+	// hang forever with nothing to show for it.
+	if volume.Status.CloneStatus.State == longhorn.VolumeCloneStateFailed {
+		if volume.Status.CloneStatus.AttemptCount >= maxCloneRetry {
+			return false, fmt.Errorf("cannot restore volume %v: the linked clone from %v it depends on failed after %v attempts",
+				volume.Name, volume.Spec.DataSource, volume.Status.CloneStatus.AttemptCount)
+		}
+		log.Debugf("Waiting for the linked clone of volume %v to be retried before restore, attempt %v of %v",
+			volume.Name, volume.Status.CloneStatus.AttemptCount, maxCloneRetry)
+		return false, nil
+	}
+	if volume.Status.CloneStatus.State != longhorn.VolumeCloneStateCompleted {
+		log.Debugf("Waiting for the linked clone of volume %v to complete before restore, current state %v",
+			volume.Name, volume.Status.CloneStatus.State)
+		return false, nil
+	}
+
+	// Waiting for the restore controller's own attachment ticket, rather than merely for
+	// the volume to be attached, asks the question that matters: is this restore
+	// protected? A satisfied ticket implies the volume is attached, since satisfaction
+	// requires both an attached state and a NodeID matching vol.Status.CurrentNodeID, and
+	// it additionally confirms the ticket generation has been observed. Starting while
+	// the ticket is unsatisfied would mean restoring onto a volume held there by somebody
+	// else, which detaches the moment that other attacher lets go and interrupts the
+	// restore mid-flight.
+	va, err := ds.GetLHVolumeAttachmentByVolumeName(volume.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Debugf("Waiting for the volume attachment of volume %v to be created before restore", volume.Name)
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "failed to get volume attachment of volume %v for backup restoration", volume.Name)
+	}
+	restoreTicketID := longhorn.GetAttachmentTicketID(longhorn.AttacherTypeVolumeRestoreController, volume.Name)
+	if !longhorn.IsAttachmentTicketSatisfied(restoreTicketID, va) {
+		log.Debugf("Waiting for the restore attachment ticket %v of volume %v to be satisfied before restore, current volume state %v",
+			restoreTicketID, volume.Name, volume.Status.State)
+		return false, nil
 	}
 
 	return true, nil
@@ -1947,8 +2026,12 @@ func handleRestoreError(log logrus.FieldLogger, engine *longhorn.Engine, rsMap m
 }
 
 func isReplicaRestoreFailedLockError(err *imclient.ReplicaError) bool {
-	failedLock := regexp.MustCompile(restoreGetLockFailedPatternMsg)
-	return failedLock.MatchString(err.Error())
+	if backupstore.IsLockConflictError(err) {
+		return true
+	}
+
+	// Engines predating the backupstore lock error rework report the conflict this way.
+	return regexp.MustCompile(restoreGetLockFailedPatternMsg).MatchString(err.Error())
 }
 
 func handleRestoreErrorForCompatibleEngine(log logrus.FieldLogger, engine *longhorn.Engine, rsMap map[string]*longhorn.RestoreStatus, backoff *flowcontrol.Backoff, err error) error {
@@ -2025,26 +2108,23 @@ func cloneSnapshot(engine *longhorn.Engine, engineClientProxy engineapi.EngineCl
 		return errors.Wrapf(err, "failed to get volume %v for cloneSnapshot", engine.Spec.VolumeName)
 	}
 
-	// For v2 linked-clone on a new enough instance manager, build the dst→src replica name map
-	// that was already computed by the scheduler (replica.Spec.LinkedCloneSrcReplicaName).
-	// This replaces the engine's auto-detection by IP+lvsUUID co-location.
+	// For v2 linked-clone, build the dst→src replica name map that was already
+	// computed by the volume controller (replica.Spec.LinkedCloneSrcReplicaName).
+	// The webhook guarantees all running IMs support this API.
 	var dstReplicaSrcReplicaPairMap map[string]string
 	if types.IsDataEngineV2(engine.Spec.DataEngine) && vol.Spec.CloneMode == longhorn.CloneModeLinkedClone {
-		im, imErr := ds.GetInstanceManagerByInstance(engine)
-		if imErr == nil && im != nil && im.Status.ProxyAPIVersion >= engineapi.MinProxyAPIVersionForNReplicaLinkedClone {
-			replicas, listErr := ds.ListVolumeReplicasRO(engine.Spec.VolumeName)
-			if listErr != nil {
-				return errors.Wrapf(listErr, "failed to list replicas for linked-clone pair map")
+		replicas, listErr := ds.ListVolumeReplicasRO(engine.Spec.VolumeName)
+		if listErr != nil {
+			return errors.Wrapf(listErr, "failed to list replicas for linked-clone pair map")
+		}
+		pairMap := map[string]string{}
+		for _, r := range replicas {
+			if r.Spec.LinkedCloneSrcReplicaName != "" {
+				pairMap[r.Name] = r.Spec.LinkedCloneSrcReplicaName
 			}
-			pairMap := map[string]string{}
-			for _, r := range replicas {
-				if r.Spec.LinkedCloneSrcReplicaName != "" {
-					pairMap[r.Name] = r.Spec.LinkedCloneSrcReplicaName
-				}
-			}
-			if len(pairMap) > 0 {
-				dstReplicaSrcReplicaPairMap = pairMap
-			}
+		}
+		if len(pairMap) > 0 {
+			dstReplicaSrcReplicaPairMap = pairMap
 		}
 	}
 
@@ -2194,11 +2274,9 @@ type rebuildContext struct {
 	fastReplicaRebuild   bool
 	grpcTimeoutSeconds   int64
 	fileSyncHTTPClientTO int64
-	// linkedCloneSrcReplicaName is the source replica name for a linked-clone rebuild.
-	// Set from replica.Spec.LinkedCloneSrcReplicaName; empty for non-clone rebuilds.
-	linkedCloneSrcReplicaName   string
-	linkedCloneSrcEngineName    string
-	linkedCloneSrcEngineAddress string
+	// linkedCloneSource identifies the source replica/engine for a linked-clone rebuild.
+	// Nil for non-clone rebuilds.
+	linkedCloneSource *imrpc.LinkedCloneSource
 }
 
 func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, addr string) (err error) {
@@ -2206,7 +2284,18 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, add
 		err = errors.Wrapf(err, "failed to start rebuild for %v of %v", replicaName, e.Name)
 	}()
 
-	log := ec.logger.WithFields(logrus.Fields{"volume": e.Spec.VolumeName, "engine": e.Name})
+	log := ec.logger.WithFields(logrus.Fields{"volume": e.Spec.VolumeName, "engine": e.Name, "replica": replicaName, "address": addr})
+
+	if !ec.claimEngineRebuild(e.Name) {
+		log.Info("Another replica rebuild is already in flight for this engine")
+		return nil
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			ec.releaseEngineRebuild(e.Name)
+		}
+	}()
 
 	// For v2, the ReplicaAdd call must go through the EngineFrontend (initiator),
 	// while membership and cleanup operations remain engine-owned.
@@ -2258,7 +2347,8 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, add
 
 	// Transfer proxy ownership to the goroutine by nil-ing the local pointer
 	// so the deferred cleanup above becomes a no-op.
-	go ec.runRebuild(rc)
+	go ec.runRebuild(rc, e.Name)
+	handedOff = true
 	rc = nil
 
 	// Wait until engine confirmed that rebuild started.
@@ -2269,6 +2359,31 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, add
 	}
 
 	return nil
+}
+
+func (ec *EngineController) claimEngineRebuild(engineName string) bool {
+	ec.rebuildingEnginesMutex.Lock()
+	defer ec.rebuildingEnginesMutex.Unlock()
+
+	if ec.rebuildingEngines[engineName] {
+		return false
+	}
+
+	ec.logger.Debugf("Marking engine %v as rebuilding", engineName)
+	ec.rebuildingEngines[engineName] = true
+	return true
+}
+
+func (ec *EngineController) releaseEngineRebuild(engineName string) {
+	ec.rebuildingEnginesMutex.Lock()
+	defer ec.rebuildingEnginesMutex.Unlock()
+
+	if ec.rebuildingEngines[engineName] {
+		ec.logger.Debugf("Removing engine %v from rebuilding map", engineName)
+		delete(ec.rebuildingEngines, engineName)
+		return
+	}
+	ec.logger.Debugf("Try to release engine %v was not marked as rebuilding", engineName)
 }
 
 // prepareRebuildContext performs all synchronous setup for a replica rebuild:
@@ -2401,15 +2516,15 @@ func (ec *EngineController) prepareRebuildContext(
 			}
 		}
 
-		rc.linkedCloneSrcReplicaName = rc.replica.Spec.LinkedCloneSrcReplicaName
+		linkedCloneSrcReplicaName := rc.replica.Spec.LinkedCloneSrcReplicaName
 
-		srcReplica, err := ec.ds.GetReplica(rc.linkedCloneSrcReplicaName)
+		srcReplica, err := ec.ds.GetReplica(linkedCloneSrcReplicaName)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to get linked-clone src replica %v for rebuild context of replica %v", rc.linkedCloneSrcReplicaName, replicaName)
+			return nil, errors.Wrapf(err, "failed to get linked-clone src replica %v for rebuild context of replica %v", linkedCloneSrcReplicaName, replicaName)
 		}
 		srcEngine, err := ec.ds.GetEngineRO(srcReplica.Spec.EngineName)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to get engine %v for linked-clone src replica %v", srcReplica.Spec.EngineName, rc.linkedCloneSrcReplicaName)
+			return nil, errors.Wrapf(err, "failed to get engine %v for linked-clone src replica %v", srcReplica.Spec.EngineName, linkedCloneSrcReplicaName)
 		}
 		// Guard: if the src engine is not yet running (e.g. still recovering after
 		// an instance manager crash), its StorageIP/Port are stale or zero.
@@ -2418,10 +2533,13 @@ func (ec *EngineController) prepareRebuildContext(
 		// src engine has come back up and reported a valid address.
 		if srcEngine.Status.CurrentState != longhorn.InstanceStateRunning {
 			return nil, fmt.Errorf("linked-clone src engine %v (for src replica %v) is not yet running (state %v): deferring rebuild until src engine recovers",
-				srcEngine.Name, rc.linkedCloneSrcReplicaName, srcEngine.Status.CurrentState)
+				srcEngine.Name, linkedCloneSrcReplicaName, srcEngine.Status.CurrentState)
 		}
-		rc.linkedCloneSrcEngineName = srcEngine.Name
-		rc.linkedCloneSrcEngineAddress = imutil.GetURL(srcEngine.Status.StorageIP, srcEngine.Status.Port)
+		rc.linkedCloneSource = &imrpc.LinkedCloneSource{
+			ReplicaName:   linkedCloneSrcReplicaName,
+			EngineName:    srcEngine.Name,
+			EngineAddress: imutil.GetURL(srcEngine.Status.StorageIP, srcEngine.Status.Port),
+		}
 	}
 
 	succeeded = true
@@ -2431,7 +2549,9 @@ func (ec *EngineController) prepareRebuildContext(
 // runRebuild is the fire-and-forget goroutine body that performs the actual
 // rebuild work: optional pre-rebuild purge, ReplicaAdd, v2 rebuild wait,
 // and optional post-rebuild purge.
-func (ec *EngineController) runRebuild(rc *rebuildContext) {
+func (ec *EngineController) runRebuild(rc *rebuildContext, rebuildingEngineName string) {
+	defer ec.releaseEngineRebuild(rebuildingEngineName)
+
 	defer rc.rebuildProxy.Close()
 	if rc.cleanupProxy != rc.rebuildProxy {
 		defer rc.cleanupProxy.Close()
@@ -2452,6 +2572,12 @@ func (ec *EngineController) runRebuild(rc *rebuildContext) {
 		}
 	}
 
+	// The engine may have been taken over by another node while this goroutine was running. The new
+	// owner does not know about this goroutine and starts its own rebuild for the same replica.
+	if !ec.isEngineOwner(rc.log, rc.currentEngine.Name) {
+		return
+	}
+
 	// Start rebuild — v1 and v2 diverge on the ReplicaAdd call.
 	var replicaAddErr error
 	if types.IsDataEngineV2(rc.engine.Spec.DataEngine) {
@@ -2461,7 +2587,7 @@ func (ec *EngineController) runRebuild(rc *rebuildContext) {
 		// TODO: Before calling ReplicaAdd for the v2 frontend path, fetch the
 		// latest size/currentSize from currentEngine and pass them through once
 		// the proxy API consumes those fields for EngineFrontend-based rebuild.
-		replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, false, rc.fastReplicaRebuild, nil, 0, rc.grpcTimeoutSeconds, rc.linkedCloneSrcReplicaName, rc.linkedCloneSrcEngineName, rc.linkedCloneSrcEngineAddress)
+		replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, false, rc.fastReplicaRebuild, nil, 0, rc.grpcTimeoutSeconds, rc.linkedCloneSource)
 		switch {
 		case replicaAddErr == nil:
 			// ok
@@ -2482,12 +2608,12 @@ func (ec *EngineController) runRebuild(rc *rebuildContext) {
 			if rc.engine.Spec.NodeID != "" {
 				ec.eventRecorder.Eventf(rc.engine, corev1.EventTypeNormal, constant.EventReasonRebuilding,
 					"Start rebuilding replica %v with Address %v for restore engine %v and volume %v", rc.replicaName, rc.addr, rc.engine.Name, rc.engine.Spec.VolumeName)
-				replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, true, rc.fastReplicaRebuild, localSync, rc.fileSyncHTTPClientTO, 0, rc.linkedCloneSrcReplicaName, rc.linkedCloneSrcEngineName, rc.linkedCloneSrcEngineAddress)
+				replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, true, rc.fastReplicaRebuild, localSync, rc.fileSyncHTTPClientTO, 0, rc.linkedCloneSource)
 			}
 		} else {
 			ec.eventRecorder.Eventf(rc.engine, corev1.EventTypeNormal, constant.EventReasonRebuilding,
 				"Start rebuilding replica %v with Address %v for normal engine %v and volume %v", rc.replicaName, rc.addr, rc.engine.Name, rc.engine.Spec.VolumeName)
-			replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, false, rc.fastReplicaRebuild, localSync, rc.fileSyncHTTPClientTO, rc.grpcTimeoutSeconds, rc.linkedCloneSrcReplicaName, rc.linkedCloneSrcEngineName, rc.linkedCloneSrcEngineAddress)
+			replicaAddErr = rc.rebuildProxy.ReplicaAdd(rc.rebuildObj, rc.replicaName, rc.replicaURL, false, rc.fastReplicaRebuild, localSync, rc.fileSyncHTTPClientTO, rc.grpcTimeoutSeconds, rc.linkedCloneSource)
 		}
 	}
 
@@ -2559,6 +2685,10 @@ func (ec *EngineController) waitForPreRebuildPurge(
 		if !shouldProceedToWaitAndRebuild(latestEngine, replicaName, addr, log) {
 			return false
 		}
+		if latestEngine.Status.OwnerID != ec.controllerID {
+			log.Warnf("Failed to proceed to rebuild since engine is now owned by %v", latestEngine.Status.OwnerID)
+			return false
+		}
 
 		purgeDone = true
 		for _, purgeStatus := range latestEngine.Status.PurgeStatus {
@@ -2596,6 +2726,19 @@ func (ec *EngineController) handleRebuildFailure(
 	} else {
 		ec.eventRecorder.Eventf(engine, corev1.EventTypeWarning, constant.EventReasonFailedRebuilding,
 			"Failed rebuilding replica with Address %v: %v", addr, rebuildErr)
+	}
+	if isReplicaAddressExistError(rebuildErr) {
+		// If operations before calling `rc.rebuildProxy.ReplicaAdd` take a long time (over 30 seconds),
+		// the second rebuild goroutine for the same replica might be created.
+		// If the replica exists when adding this replica, the replica should have been rebuilt already by previous rebuild goroutine.
+		// Therefore, skip the operations below.
+		log.WithError(rebuildErr).Warn("Replica rebuild failed because replica exists")
+		return
+	}
+	if !ec.isEngineOwner(log, engine.Name) {
+		// The new owner may be rebuilding the same replica. Removing it from the engine or marking it
+		// failed here would tear down that rebuild, so leave the cleanup to the new owner.
+		return
 	}
 
 	log.Infof("Removing failed rebuilding replica %v", addr)
@@ -2967,6 +3110,21 @@ func removeInvalidEngineOpStatus(e *longhorn.Engine) {
 // shouldProceedToRebuild checks a variety of conditions that may cause us not to proceed with waiting for snapshot
 // purge and/or rebuilding a replica. We pass the logger to it so it can decide what level to log at depending on the
 // issue. We do not return any errors because shouldProceedToRebuild is called by startRebuilding in a goroutine.
+// isEngineOwner reports whether this node still owns the engine. A rebuild goroutine outlives the
+// engine sync that started it, so the engine can be owned by another node by the time it checks.
+func (ec *EngineController) isEngineOwner(log *logrus.Entry, engineName string) bool {
+	e, err := ec.ds.GetEngineRO(engineName)
+	if err != nil {
+		log.WithError(err).Warnf("Failed to get engine %v to check its owner", engineName)
+		return false
+	}
+	if e.Status.OwnerID != ec.controllerID {
+		log.Warnf("Engine %v is now owned by %v instead of %v", engineName, e.Status.OwnerID, ec.controllerID)
+		return false
+	}
+	return true
+}
+
 func shouldProceedToWaitAndRebuild(e *longhorn.Engine, replicaName, originalReplicaAddr string, log *logrus.Entry) bool {
 	// The engine is no longer running.
 	if e.Status.CurrentState != longhorn.InstanceStateRunning {
@@ -3227,6 +3385,11 @@ func isV2ReplicaAddAlreadyInProgressError(err error) bool {
 
 func isV2ReplicaAddRestoreInProgressError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "restore is in progress")
+}
+
+func isReplicaAddressExistError(err error) bool {
+	// If the replica address already exists when creating a replica, it will return an error as "replica already exists at address tcp://10.1.1.10:12345".
+	return err != nil && strings.Contains(err.Error(), etypes.ErrorStringReplicaAddressExist)
 }
 
 func isV2ExpansionIncomplete(engine *longhorn.Engine) bool {
