@@ -1,5 +1,5 @@
 {
-  "extends": ["github>longhorn/release:renovate-default"],
+  "extends": ["github>longhorn/release:renovate-default", "github>m11s-io/.github:renovate-config"],
   "packageRules": [
     {
       "matchBaseBranches": ["master", "main", "/^v\\d+\\.\\d+\\.x/"],
