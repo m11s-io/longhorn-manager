@@ -7,16 +7,24 @@ on:
     - main
     - "v*.*.*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   codespell:
-    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    runs-on: ubuntu-26.04
     steps:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         fetch-depth: 1
     - name: Check code spell
-      uses: codespell-project/actions-codespell@406322ec52dd7b488e48c1c4b82e2a8b3a1bf630 # v2
+      uses: codespell-project/actions-codespell@8f01853be192eb0f849a5c7d721450e7a467c579 # v2
       with:
         check_filenames: true
         ignore_words_file: .codespellignore

@@ -21,13 +21,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/longhorn/backupstore"
 
 	imutil "github.com/longhorn/longhorn-instance-manager/pkg/util"
 
 	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/scheduler"
 	"github.com/longhorn/longhorn-manager/types"
 	"github.com/longhorn/longhorn-manager/util"
 
@@ -55,7 +58,7 @@ func initSettingsNameValue(name, value string) *longhorn.Setting {
 
 func newTestVolumeController(lhClient *lhfake.Clientset, kubeClient *fake.Clientset, extensionsClient *apiextensionsfake.Clientset,
 	informerFactories *util.InformerFactories, controllerID string) (*VolumeController, error) {
-	ds := datastore.NewDataStore(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
+	ds := datastore.NewDataStoreForGlobal(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
 
 	proxyConnCounter := util.NewAtomicCounter()
 
@@ -74,6 +77,93 @@ func newTestVolumeController(lhClient *lhfake.Clientset, kubeClient *fake.Client
 	vc.nowHandler = getTestNow
 
 	return vc, nil
+}
+
+func (s *TestSuite) TestGetPlannedDetachedReplicasForVolume(c *C) {
+	kubeClient := fake.NewSimpleClientset()                    // nolint: staticcheck
+	lhClient := lhfake.NewSimpleClientset()                    // nolint: staticcheck
+	extensionsClient := apiextensionsfake.NewSimpleClientset() // nolint: staticcheck
+	informerFactories := util.NewInformerFactories(TestNamespace, kubeClient, lhClient, controller.NoResyncPeriodFunc())
+
+	imuIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().InstanceManagerUpgrades().Informer().GetIndexer()
+	vc, err := newTestVolumeController(lhClient, kubeClient, extensionsClient, informerFactories, TestOwnerID1)
+	c.Assert(err, IsNil)
+
+	volume := newVolume(TestVolumeName, 3)
+	volume.Spec.DataEngine = longhorn.DataEngineTypeV2
+	volume.Status.State = longhorn.VolumeStateAttached
+
+	imu := newInstanceManagerUpgrade("imu-test", TestNode1, TestExtraInstanceManagerImage, longhorn.InstanceManagerUpgradeStateWaitingForSourceIM)
+	imu.Status.PlannedDetachedReplicas = map[string][]longhorn.PlannedDetachedReplica{
+		TestVolumeName: {
+			{
+				Name:    "replica-on-upgrading-node",
+				Address: "10.0.0.1:20001",
+			},
+		},
+	}
+	err = imuIndexer.Add(imu)
+	c.Assert(err, IsNil)
+
+	planned, err := vc.getPlannedDetachedReplicasForVolume(volume)
+	c.Assert(err, IsNil)
+	_, ok := planned["replica-on-upgrading-node"]
+	c.Assert(ok, Equals, true)
+
+	for _, state := range []longhorn.VolumeState{
+		longhorn.VolumeStateAttaching,
+		longhorn.VolumeStateDetaching,
+	} {
+		volume.Status.State = state
+		planned, err = vc.getPlannedDetachedReplicasForVolume(volume)
+		c.Assert(err, IsNil)
+		_, ok = planned["replica-on-upgrading-node"]
+		c.Assert(ok, Equals, true)
+	}
+
+	volume.Status.State = longhorn.VolumeStateDetached
+	planned, err = vc.getPlannedDetachedReplicasForVolume(volume)
+	c.Assert(err, IsNil)
+	c.Assert(planned, HasLen, 0)
+
+	volume.Status.State = longhorn.VolumeStateAttached
+	imu.Status.State = longhorn.InstanceManagerUpgradeStateWaitingForHealthyVolumes
+	err = imuIndexer.Update(imu)
+	c.Assert(err, IsNil)
+
+	planned, err = vc.getPlannedDetachedReplicasForVolume(volume)
+	c.Assert(err, IsNil)
+	c.Assert(planned, HasLen, 0)
+
+	imu.Status.State = longhorn.InstanceManagerUpgradeStateRelocatingEngines
+	imu.Status.Engines = map[string]longhorn.EngineRelocation{
+		TestVolumeName: {
+			OriginalNodeID:  TestNode1,
+			TemporaryNodeID: TestNode2,
+		},
+	}
+	volume.Status.CurrentEngineNodeID = TestNode1
+	err = imuIndexer.Update(imu)
+	c.Assert(err, IsNil)
+
+	planned, err = vc.getPlannedDetachedReplicasForVolume(volume)
+	c.Assert(err, IsNil)
+	_, ok = planned["replica-on-upgrading-node"]
+	c.Assert(ok, Equals, true)
+
+	otherVolume := newVolume("other-volume", 3)
+	otherVolume.Spec.DataEngine = longhorn.DataEngineTypeV2
+	otherVolume.Status.State = longhorn.VolumeStateAttached
+	imu.Status.PlannedDetachedReplicas[otherVolume.Name] = []longhorn.PlannedDetachedReplica{{
+		Name: "replica-on-other-volume",
+	}}
+	err = imuIndexer.Update(imu)
+	c.Assert(err, IsNil)
+
+	planned, err = vc.getPlannedDetachedReplicasForVolume(otherVolume)
+	c.Assert(err, IsNil)
+	_, ok = planned["replica-on-other-volume"]
+	c.Assert(ok, Equals, true)
 }
 
 type VolumeTestCase struct {
@@ -1147,6 +1237,192 @@ func (s *TestSuite) TestVolumeLifeCycle(c *C) {
 	s.runTestCases(c, testCases)
 }
 
+func (s *TestSuite) TestOpenVolumeDependentResourcesFailsNeverStartedReplicaOnDownNode(c *C) {
+	testCases := []struct {
+		name                    string
+		nodeReady               longhorn.ConditionStatus
+		desireState             longhorn.InstanceState
+		currentState            longhorn.InstanceState
+		starting                bool
+		started                 bool
+		lastHealthyAt           string
+		expectFailed            bool
+		expectDesiredState      longhorn.InstanceState
+		expectReplicaMapUpdated bool
+	}{
+		{
+			name:                    "status starting never-started replica",
+			nodeReady:               longhorn.ConditionStatusFalse,
+			desireState:             longhorn.InstanceStateStopped,
+			currentState:            longhorn.InstanceStateStopped,
+			starting:                true,
+			expectFailed:            true,
+			expectDesiredState:      longhorn.InstanceStateStopped,
+			expectReplicaMapUpdated: true,
+		},
+		{
+			name:                    "desired running never-started replica",
+			nodeReady:               longhorn.ConditionStatusFalse,
+			desireState:             longhorn.InstanceStateRunning,
+			currentState:            longhorn.InstanceStateStopped,
+			expectFailed:            true,
+			expectDesiredState:      longhorn.InstanceStateStopped,
+			expectReplicaMapUpdated: true,
+		},
+		{
+			name:               "replica never requested to run",
+			nodeReady:          longhorn.ConditionStatusFalse,
+			desireState:        longhorn.InstanceStateStopped,
+			currentState:       longhorn.InstanceStateStopped,
+			expectDesiredState: longhorn.InstanceStateStopped,
+		},
+		{
+			name:               "stopped replica previously observed running",
+			nodeReady:          longhorn.ConditionStatusFalse,
+			desireState:        longhorn.InstanceStateRunning,
+			currentState:       longhorn.InstanceStateStopped,
+			starting:           true,
+			started:            true,
+			expectDesiredState: longhorn.InstanceStateRunning,
+		},
+		{
+			name:               "stopped previously healthy replica",
+			nodeReady:          longhorn.ConditionStatusFalse,
+			desireState:        longhorn.InstanceStateRunning,
+			currentState:       longhorn.InstanceStateStopped,
+			starting:           true,
+			lastHealthyAt:      getTestNow(),
+			expectDesiredState: longhorn.InstanceStateRunning,
+		},
+		{
+			name:               "replica process still starting on down node",
+			nodeReady:          longhorn.ConditionStatusFalse,
+			desireState:        longhorn.InstanceStateRunning,
+			currentState:       longhorn.InstanceStateStarting,
+			starting:           true,
+			expectDesiredState: longhorn.InstanceStateRunning,
+		},
+		{
+			name:                    "never-started rebuilding replica on ready node",
+			nodeReady:               longhorn.ConditionStatusTrue,
+			desireState:             longhorn.InstanceStateRunning,
+			currentState:            longhorn.InstanceStateStopped,
+			starting:                true,
+			expectDesiredState:      longhorn.InstanceStateRunning,
+			expectReplicaMapUpdated: true,
+		},
+		{
+			name:               "replica process still starting on ready node",
+			nodeReady:          longhorn.ConditionStatusTrue,
+			desireState:        longhorn.InstanceStateRunning,
+			currentState:       longhorn.InstanceStateStarting,
+			starting:           true,
+			expectDesiredState: longhorn.InstanceStateRunning,
+		},
+	}
+
+	for _, tc := range testCases {
+		c.Logf("testing %v", tc.name)
+
+		kubeClient := fake.NewSimpleClientset()                    // nolint: staticcheck
+		lhClient := lhfake.NewSimpleClientset()                    // nolint: staticcheck
+		extensionsClient := apiextensionsfake.NewSimpleClientset() // nolint: staticcheck
+		informerFactories := util.NewInformerFactories(TestNamespace, kubeClient, lhClient, controller.NoResyncPeriodFunc())
+
+		vc, err := newTestVolumeController(lhClient, kubeClient, extensionsClient, informerFactories, TestOwnerID1)
+		c.Assert(err, IsNil)
+
+		nodeIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().Nodes().Informer().GetIndexer()
+		err = nodeIndexer.Add(newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, ""))
+		c.Assert(err, IsNil)
+		nodeReason := ""
+		if tc.nodeReady == longhorn.ConditionStatusFalse {
+			nodeReason = string(longhorn.NodeConditionReasonKubernetesNodeNotReady)
+		}
+		err = nodeIndexer.Add(newNode(TestNode2, TestNamespace, true, tc.nodeReady, nodeReason))
+		c.Assert(err, IsNil)
+
+		volume := newVolume(TestVolumeName, 2)
+		volume.Spec.NodeID = TestNode1
+		volume.Status.CurrentNodeID = TestNode1
+		volume.Status.CurrentImage = TestEngineImage
+		volume.Status.State = longhorn.VolumeStateAttached
+
+		engine := newEngineForVolume(volume)
+		engine.Spec.NodeID = TestNode1
+		engine.Spec.DesireState = longhorn.InstanceStateRunning
+
+		replacementReplica := newReplicaForVolume(volume, engine, TestNode1, TestDiskID1)
+		replacementReplica.Spec.DesireState = longhorn.InstanceStateRunning
+		replacementReplica.Status.CurrentState = longhorn.InstanceStateRunning
+		replacementReplica.Status.Started = true
+		replacementReplica.Status.IP = TestIP1
+		replacementReplica.Status.StorageIP = TestIP1
+		replacementReplica.Status.Port = 10000
+
+		candidate := newReplicaForVolume(volume, engine, TestNode2, TestDiskID1)
+		candidate.Spec.DesireState = tc.desireState
+		candidate.Spec.RebuildRetryCount = 1
+		candidate.Spec.LastHealthyAt = tc.lastHealthyAt
+		candidate.Status.CurrentState = tc.currentState
+		candidate.Status.Starting = tc.starting
+		candidate.Status.Started = tc.started
+
+		replacementInstanceManager := newInstanceManager(
+			TestInstanceManagerName+"-"+TestNode1, longhorn.InstanceManagerStateRunning,
+			TestOwnerID1, TestNode1, TestIP1,
+			map[string]longhorn.InstanceProcess{},
+			map[string]longhorn.InstanceProcess{},
+			map[string]longhorn.InstanceProcess{},
+			longhorn.DataEngineTypeV1,
+			TestInstanceManagerImage,
+			false,
+		)
+		replacementReplica.Status.InstanceManagerName = replacementInstanceManager.Name
+
+		candidateInstanceManager := newInstanceManager(
+			TestInstanceManagerName+"-"+TestNode2, longhorn.InstanceManagerStateRunning,
+			TestOwnerID1, TestNode2, TestIP2,
+			map[string]longhorn.InstanceProcess{},
+			map[string]longhorn.InstanceProcess{},
+			map[string]longhorn.InstanceProcess{},
+			longhorn.DataEngineTypeV1,
+			TestInstanceManagerImage,
+			false,
+		)
+		candidate.Status.InstanceManagerName = candidateInstanceManager.Name
+
+		instanceManagerIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().InstanceManagers().Informer().GetIndexer()
+		err = instanceManagerIndexer.Add(replacementInstanceManager)
+		c.Assert(err, IsNil)
+		err = instanceManagerIndexer.Add(candidateInstanceManager)
+		c.Assert(err, IsNil)
+
+		replicas := map[string]*longhorn.Replica{
+			replacementReplica.Name: replacementReplica,
+			candidate.Name:          candidate,
+		}
+
+		err = vc.openVolumeDependentResources(volume, engine, replicas, nil, getLoggerForVolume(vc.logger, volume))
+		c.Assert(err, IsNil)
+
+		if tc.expectFailed {
+			c.Assert(candidate.Spec.FailedAt, Equals, getTestNow())
+			c.Assert(candidate.Spec.LastFailedAt, Equals, getTestNow())
+		} else {
+			c.Assert(candidate.Spec.FailedAt, Equals, "")
+			c.Assert(candidate.Spec.LastFailedAt, Equals, "")
+		}
+		c.Assert(candidate.Spec.DesireState, Equals, tc.expectDesiredState)
+
+		expectedReplicaAddressMap := map[string]string{}
+		if tc.expectReplicaMapUpdated {
+			expectedReplicaAddressMap[replacementReplica.Name] = imutil.GetURL(replacementReplica.Status.StorageIP, replacementReplica.Status.Port)
+		}
+		c.Assert(engine.Spec.ReplicaAddressMap, DeepEquals, expectedReplicaAddressMap)
+	}
+}
+
 func (s *TestSuite) TestTooManySnapshotsThresholdBehavior(c *C) {
 	// Ensure lister skip for unit tests
 	datastore.SkipListerCheck = true
@@ -2061,7 +2337,7 @@ func setupSwitchoverTestInfra(c *C) (
 	v.Status.CurrentEngineNodeID = TestNode1
 	v.Status.Robustness = longhorn.VolumeRobustnessHealthy
 
-	// Current (old) engine — running on node1
+	// Current (old) engine - running on node1
 	currentEngine = newEngineForVolume(v)
 	currentEngine.Spec.DataEngine = longhorn.DataEngineTypeV2
 	currentEngine.Spec.Active = true
@@ -2072,7 +2348,7 @@ func setupSwitchoverTestInfra(c *C) (
 	currentEngine.Status.StorageIP = "10.1.0.1"
 	currentEngine.Status.Port = 8501
 
-	// Migration engine — running on node2
+	// Migration engine - running on node2
 	migrationEngine = newEngineForVolume(v)
 	migrationEngine.Spec.DataEngine = longhorn.DataEngineTypeV2
 	migrationEngine.Spec.Active = false
@@ -2083,7 +2359,7 @@ func setupSwitchoverTestInfra(c *C) (
 	migrationEngine.Status.StorageIP = "10.1.0.2"
 	migrationEngine.Status.Port = 8502
 
-	// Replica — assigned to the current engine, and also used for migration.
+	// Replica - assigned to the current engine, and also used for migration.
 	replica = newReplicaForVolume(v, currentEngine, TestNode1, TestDiskID1)
 	replica.Spec.DesireState = longhorn.InstanceStateRunning
 	replica.Status.CurrentState = longhorn.InstanceStateRunning
@@ -2099,7 +2375,7 @@ func setupSwitchoverTestInfra(c *C) (
 		replica.Name: imutil.GetURL(replica.Status.StorageIP, replica.Status.Port),
 	}
 
-	// EF — Spec already points to migration engine target (from a prior cycle).
+	// EF - Spec already points to migration engine target (from a prior cycle).
 	ef = newEngineFrontendForVolume(v, currentEngine.Name, TestNode1, "")
 	ef.Spec.TargetIP = migrationEngine.Status.StorageIP
 	ef.Spec.TargetPort = migrationEngine.Status.Port
@@ -2131,20 +2407,24 @@ func (s *TestSuite) TestProcessEngineSwitchoverKeepsOldEngineRunningUntilTargetS
 	err := vc.processEngineSwitchover(v, es, rs, efs)
 	c.Assert(err, IsNil)
 
-	// The old engine must still be running — not stopped.
+	// The old engine must still be running - not stopped.
 	c.Assert(currentEngine.Spec.DesireState, Equals, longhorn.InstanceStateRunning)
 }
 
-// TestProcessEngineSwitchoverStopsOldEngineAfterSwitchoverComplete verifies
-// that the old engine is stopped only after the EngineFrontend status
-// confirms the migration target is active.
-func (s *TestSuite) TestProcessEngineSwitchoverStopsOldEngineAfterSwitchoverComplete(c *C) {
-	vc, _, _, v, currentEngine, migrationEngine, replica, ef := setupSwitchoverTestInfra(c)
+// TestProcessEngineSwitchoverRequestsOldEngineDeletionAfterSwitchoverComplete
+// verifies that the old engine deletion is requested only after the
+// EngineFrontend status confirms the migration target is active.
+func (s *TestSuite) TestProcessEngineSwitchoverRequestsOldEngineDeletionAfterSwitchoverComplete(c *C) {
+	vc, lhClient, _, v, currentEngine, migrationEngine, replica, ef := setupSwitchoverTestInfra(c)
 
 	// EF switchover is complete: both Spec and Status show the new target.
 	ef.Status.CurrentState = longhorn.InstanceStateRunning
 	ef.Status.TargetIP = migrationEngine.Status.StorageIP
 	ef.Status.TargetPort = migrationEngine.Status.Port
+
+	createdCurrentEngine, err := lhClient.LonghornV1beta2().Engines(TestNamespace).Create(context.TODO(), currentEngine, metav1.CreateOptions{})
+	c.Assert(err, IsNil)
+	currentEngine = createdCurrentEngine
 
 	es := map[string]*longhorn.Engine{
 		currentEngine.Name:   currentEngine,
@@ -2153,12 +2433,11 @@ func (s *TestSuite) TestProcessEngineSwitchoverStopsOldEngineAfterSwitchoverComp
 	rs := map[string]*longhorn.Replica{replica.Name: replica}
 	efs := map[string]*longhorn.EngineFrontend{ef.Name: ef}
 
-	err := vc.processEngineSwitchover(v, es, rs, efs)
+	err = vc.processEngineSwitchover(v, es, rs, efs)
 	c.Assert(err, IsNil)
 
-	// The old engine must be stopped after switchover is confirmed.
-	c.Assert(currentEngine.Spec.DesireState, Equals, longhorn.InstanceStateStopped)
-	c.Assert(currentEngine.Spec.Active, Equals, false)
+	// The old engine is removed from the local map after its deletion is requested.
+	c.Assert(es[currentEngine.Name], IsNil)
 
 	// The migration engine is now the active engine.
 	c.Assert(migrationEngine.Spec.Active, Equals, true)
@@ -2169,6 +2448,138 @@ func (s *TestSuite) TestProcessEngineSwitchoverStopsOldEngineAfterSwitchoverComp
 	// Replica should be reassigned to the migration engine.
 	c.Assert(replica.Spec.EngineName, Equals, migrationEngine.Name)
 	c.Assert(replica.Spec.MigrationEngineName, Equals, "")
+}
+
+// TestProcessEngineSwitchoverDoesNotPromoteMigrationEngineWhenOldEngineDeleteFails
+// verifies that an old engine delete failure leaves the migration state unchanged.
+// This prevents a persisted state with two active engines from blocking later cleanup.
+func (s *TestSuite) TestProcessEngineSwitchoverDoesNotPromoteMigrationEngineWhenOldEngineDeleteFails(c *C) {
+	vc, lhClient, _, v, currentEngine, migrationEngine, replica, ef := setupSwitchoverTestInfra(c)
+
+	ef.Status.CurrentState = longhorn.InstanceStateRunning
+	ef.Status.TargetIP = migrationEngine.Status.StorageIP
+	ef.Status.TargetPort = migrationEngine.Status.Port
+
+	lhClient.PrependReactor("delete", "engines", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("transient delete failure")
+	})
+
+	es := map[string]*longhorn.Engine{
+		currentEngine.Name:   currentEngine,
+		migrationEngine.Name: migrationEngine,
+	}
+	rs := map[string]*longhorn.Replica{replica.Name: replica}
+	efs := map[string]*longhorn.EngineFrontend{ef.Name: ef}
+
+	err := vc.processEngineSwitchover(v, es, rs, efs)
+	c.Assert(err, NotNil)
+
+	c.Assert(currentEngine.Spec.Active, Equals, true)
+	c.Assert(currentEngine.Spec.DesireState, Equals, longhorn.InstanceStateRunning)
+	c.Assert(migrationEngine.Spec.Active, Equals, false)
+	c.Assert(replica.Spec.EngineName, Equals, currentEngine.Name)
+	c.Assert(replica.Spec.MigrationEngineName, Equals, migrationEngine.Name)
+	c.Assert(v.Status.CurrentEngineNodeID, Equals, TestNode1)
+}
+
+func (s *TestSuite) TestProcessEngineSwitchoverRecoversAfterPromotionConflict(c *C) {
+	for _, oldEngineDeleted := range []bool{false, true} {
+		vc, lhClient, engineIndexer, v, currentEngine, migrationEngine, replica, ef := setupSwitchoverTestInfra(c)
+		ef.Status.CurrentState = longhorn.InstanceStateRunning
+		ef.Status.TargetIP = migrationEngine.Status.StorageIP
+		ef.Status.TargetPort = migrationEngine.Status.Port
+		persistedVolume := v.DeepCopy()
+		for _, engine := range []*longhorn.Engine{currentEngine, migrationEngine} {
+			_, err := lhClient.LonghornV1beta2().Engines(TestNamespace).Create(context.TODO(), engine, metav1.CreateOptions{})
+			c.Assert(err, IsNil)
+		}
+		failPromotion := true
+		lhClient.PrependReactor("update", "engines", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if !failPromotion {
+				return false, nil, nil
+			}
+			return true, nil, apierrors.NewConflict(longhorn.Resource("engines"), migrationEngine.Name, fmt.Errorf("engine status changed"))
+		})
+		es := map[string]*longhorn.Engine{currentEngine.Name: currentEngine, migrationEngine.Name: migrationEngine}
+		rs := map[string]*longhorn.Replica{replica.Name: replica}
+		efs := map[string]*longhorn.EngineFrontend{ef.Name: ef}
+		err := vc.processEngineSwitchover(v, es, rs, efs)
+		c.Assert(err, IsNil)
+		c.Assert(es[currentEngine.Name], IsNil)
+
+		// Simulate the deferred engine update conflicting after replica ownership
+		// has changed. The volume status update is then skipped.
+		_, err = vc.ds.UpdateEngine(migrationEngine)
+		c.Assert(apierrors.IsConflict(err), Equals, true)
+		persistedMigrationEngine, err := lhClient.LonghornV1beta2().Engines(TestNamespace).Get(context.TODO(), migrationEngine.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(persistedMigrationEngine.Spec.Active, Equals, false)
+		c.Assert(persistedVolume.Status.CurrentEngineNodeID, Equals, TestNode1)
+		c.Assert(engineIndexer.Add(persistedMigrationEngine), IsNil)
+		if !oldEngineDeleted {
+			// The fake client deletes immediately; model the informer retaining
+			// the old engine while its finalizer runs.
+			deletionTime := metav1.Now()
+			currentEngine.DeletionTimestamp = &deletionTime
+			c.Assert(engineIndexer.Add(currentEngine), IsNil)
+		}
+
+		// A retry works on fresh copies and must reuse the existing target,
+		// whether the old engine is still deleting or has disappeared.
+		es, err = vc.ds.ListVolumeEngines(v.Name)
+		c.Assert(err, IsNil)
+		engineCount := len(es)
+		lhClient.ClearActions()
+		err = vc.processEngineSwitchover(persistedVolume, es, rs, efs)
+		c.Assert(err, IsNil)
+		c.Assert(lhClient.Actions(), HasLen, 0)
+		c.Assert(es, HasLen, engineCount)
+		c.Assert(es[migrationEngine.Name].Spec.Active, Equals, true)
+		c.Assert(persistedVolume.Status.CurrentEngineNodeID, Equals, TestNode2)
+		c.Assert(replica.Spec.EngineName, Equals, migrationEngine.Name)
+		c.Assert(replica.Spec.MigrationEngineName, Equals, "")
+		c.Assert(persistedMigrationEngine.Spec.Active, Equals, false)
+
+		failPromotion = false
+		_, err = vc.ds.UpdateEngine(es[migrationEngine.Name])
+		c.Assert(err, IsNil)
+		promotedEngine, err := lhClient.LonghornV1beta2().Engines(TestNamespace).Get(context.TODO(), migrationEngine.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(promotedEngine.Spec.Active, Equals, true)
+	}
+}
+
+func (s *TestSuite) TestProcessEngineSwitchoverIgnoresDeletingActiveEngine(c *C) {
+	vc, lhClient, _, v, currentEngine, migrationEngine, replica, ef := setupSwitchoverTestInfra(c)
+
+	// The old engine remains visible while its finalizer runs, and the new
+	// engine has been promoted before the volume status update is observed.
+	now := metav1.Now()
+	currentEngine.DeletionTimestamp = &now
+	migrationEngine.Spec.Active = true
+	replica.Spec.EngineName = migrationEngine.Name
+	replica.Spec.MigrationEngineName = ""
+
+	es := map[string]*longhorn.Engine{
+		currentEngine.Name:   currentEngine,
+		migrationEngine.Name: migrationEngine,
+	}
+	rs := map[string]*longhorn.Replica{replica.Name: replica}
+	efs := map[string]*longhorn.EngineFrontend{ef.Name: ef}
+	lhClient.ClearActions()
+
+	// Repeat to exercise different map iteration orders while deletion is pending.
+	for i := 0; i < 100; i++ {
+		v.Status.CurrentEngineNodeID = TestNode1
+		err := vc.processEngineSwitchover(v, es, rs, efs)
+		c.Assert(err, IsNil)
+		c.Assert(v.Status.CurrentEngineNodeID, Equals, TestNode2)
+		c.Assert(v.Status.SwitchoverState, Equals, longhorn.VolumeSwitchoverStateFinalizing)
+		c.Assert(es, HasLen, 2)
+		c.Assert(replica.Spec.EngineName, Equals, migrationEngine.Name)
+		c.Assert(replica.Spec.MigrationEngineName, Equals, "")
+		c.Assert(lhClient.Actions(), HasLen, 0)
+	}
 }
 
 // TestProcessEngineSwitchoverCleanupUsesActiveEngine verifies that once
@@ -2185,8 +2596,7 @@ func (s *TestSuite) TestProcessEngineSwitchoverCleanupUsesActiveEngine(c *C) {
 	v.Spec.NodeID = TestNode1
 	v.Status.CurrentNodeID = TestNode1
 
-	// Both engines are temporarily on the target engine node after a reverse
-	// switchover/remount cycle, but only the new current engine is Active.
+	// Only the new current engine is Active.
 	currentEngine.Spec.Active = false
 	currentEngine.Spec.NodeID = TestNode2
 	currentEngine.Spec.DesireState = longhorn.InstanceStateRunning
@@ -2265,6 +2675,162 @@ func (s *TestSuite) TestEvictReplicasSkipsReplenishmentForV2StrictLocalVolume(c 
 	c.Assert(err, IsNil)
 	c.Assert(len(rs), Equals, 1)
 	c.Assert(rs[replica.Name], Equals, replica)
+}
+
+// setupReplenishReplicasTestInfra builds a degraded 2-replica volume whose replica on TestNode1 has
+// failed with the given rebuild failure reason and is still within the volume controller reuse backoff.
+func setupReplenishReplicasTestInfra(c *C, rebuildFailedReason string) (
+	*VolumeController, *longhorn.Volume, *longhorn.Engine, map[string]*longhorn.Replica, *longhorn.Replica) {
+	datastore.SkipListerCheck = true
+
+	kubeClient := fake.NewSimpleClientset()                    // nolint: staticcheck
+	lhClient := lhfake.NewSimpleClientset()                    // nolint: staticcheck
+	extensionsClient := apiextensionsfake.NewSimpleClientset() // nolint: staticcheck
+	informerFactories := util.NewInformerFactories(TestNamespace, kubeClient, lhClient, controller.NoResyncPeriodFunc())
+
+	vc, err := newTestVolumeController(lhClient, kubeClient, extensionsClient, informerFactories, TestOwnerID1)
+	c.Assert(err, IsNil)
+
+	nIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().Nodes().Informer().GetIndexer()
+	eiIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().EngineImages().Informer().GetIndexer()
+	imIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().InstanceManagers().Informer().GetIndexer()
+	sIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().Settings().Informer().GetIndexer()
+	rIndexer := informerFactories.LhInformerFactory.Longhorn().V1beta2().Replicas().Informer().GetIndexer()
+
+	ei := newEngineImage(TestEngineImage, longhorn.EngineImageStateDeployed)
+	ei.Status.NodeDeploymentMap[TestNode1] = true
+	ei.Status.NodeDeploymentMap[TestNode2] = true
+	createdEI, err := lhClient.LonghornV1beta2().EngineImages(TestNamespace).Create(context.TODO(), ei, metav1.CreateOptions{})
+	c.Assert(err, IsNil)
+	c.Assert(eiIndexer.Add(createdEI), IsNil)
+
+	for _, nodeID := range []string{TestNode1, TestNode2} {
+		createdNode, err := lhClient.LonghornV1beta2().Nodes(TestNamespace).Create(context.TODO(),
+			newNode(nodeID, TestNamespace, true, longhorn.ConditionStatusTrue, ""), metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(nIndexer.Add(createdNode), IsNil)
+
+		im := newInstanceManager(TestInstanceManagerName+"-"+nodeID, longhorn.InstanceManagerStateRunning,
+			TestOwnerID1, nodeID, TestIP1,
+			map[string]longhorn.InstanceProcess{}, map[string]longhorn.InstanceProcess{}, map[string]longhorn.InstanceProcess{},
+			longhorn.DataEngineTypeV1, TestInstanceManagerImage, false)
+		createdIM, err := lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Create(context.TODO(), im, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(imIndexer.Add(createdIM), IsNil)
+	}
+
+	settings := map[string]string{
+		string(types.SettingNameDefaultEngineImage):          TestEngineImage,
+		string(types.SettingNameDefaultInstanceManagerImage): TestInstanceManagerImage,
+		// The replenishment wait interval has already passed, so only the reuse backoff can hold a replacement back.
+		string(types.SettingNameReplicaReplenishmentWaitInterval): "0",
+		string(types.SettingNameReplicaSoftAntiAffinity):          "false",
+		string(types.SettingNameReplicaZoneSoftAntiAffinity):      "true",
+		string(types.SettingNameReplicaDiskSoftAntiAffinity):      "true",
+	}
+	for name, value := range settings {
+		setting, err := lhClient.LonghornV1beta2().Settings(TestNamespace).Create(context.TODO(),
+			initSettingsNameValue(name, value), metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(sIndexer.Add(setting), IsNil)
+	}
+
+	v := newVolume(TestVolumeName, 2)
+	v.Spec.DataEngine = longhorn.DataEngineTypeV1
+	v.Spec.NodeID = TestNode1
+	v.Status.State = longhorn.VolumeStateAttached
+	v.Status.CurrentNodeID = TestNode1
+	v.Status.CurrentImage = TestEngineImage
+	v.Status.Robustness = longhorn.VolumeRobustnessDegraded
+	v.Status.LastDegradedAt = getTestNow()
+
+	e := newEngineForVolume(v)
+	e.Spec.DataEngine = longhorn.DataEngineTypeV1
+	e.Spec.NodeID = TestNode1
+	e.Status.CurrentState = longhorn.InstanceStateRunning
+
+	// Keep the healthy replica on a different disk so that the failed replica's disk stays a reuse candidate.
+	healthyReplica := newReplicaForVolume(v, e, TestNode2, TestDiskID2)
+	healthyReplica.Spec.DataEngine = longhorn.DataEngineTypeV1
+	healthyReplica.Spec.HealthyAt = getTestNow()
+	healthyReplica.Status.CurrentState = longhorn.InstanceStateRunning
+	healthyReplica.Status.IP = TestIP2
+	healthyReplica.Status.StorageIP = TestIP2
+	healthyReplica.Status.Port = randomPort()
+
+	failedReplica := newReplicaForVolume(v, e, TestNode1, TestDiskID1)
+	failedReplica.Spec.DataEngine = longhorn.DataEngineTypeV1
+	failedReplica.Spec.HealthyAt = getTestNow()
+	setReplicaFailedAt(failedReplica, getTestNow())
+	failedReplica.Status.Conditions = types.SetCondition(failedReplica.Status.Conditions,
+		longhorn.ReplicaConditionTypeRebuildFailed, longhorn.ConditionStatusTrue, rebuildFailedReason, "")
+
+	e.Spec.ReplicaAddressMap = map[string]string{
+		healthyReplica.Name: imutil.GetURL(healthyReplica.Status.StorageIP, healthyReplica.Status.Port),
+	}
+	e.Status.ReplicaModeMap = map[string]longhorn.ReplicaMode{
+		healthyReplica.Name: longhorn.ReplicaModeRW,
+	}
+
+	rs := map[string]*longhorn.Replica{}
+	for _, r := range []*longhorn.Replica{healthyReplica, failedReplica} {
+		createdReplica, err := lhClient.LonghornV1beta2().Replicas(TestNamespace).Create(context.TODO(), r, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(rIndexer.Add(createdReplica), IsNil)
+		rs[r.Name] = r
+	}
+
+	vc.backoff.Next(failedReplica.Name, time.Now())
+
+	return vc, v, e, rs, failedReplica
+}
+
+// https://github.com/longhorn/longhorn/issues/13705
+func (s *TestSuite) TestReplenishReplicasWaitsForReusableReplicaFailedByNetwork(c *C) {
+	vc, v, e, rs, failedReplica := setupReplenishReplicasTestInfra(c, longhorn.ReplicaConditionReasonRebuildFailedDisconnection)
+
+	err := vc.replenishReplicas(v, e, rs, "")
+	c.Assert(err, IsNil)
+
+	c.Assert(rs, HasLen, 2)
+	c.Assert(rs[failedReplica.Name], NotNil)
+	c.Assert(failedReplica.Spec.FailedAt, Not(Equals), "")
+}
+
+// A reusable replica is retried rather than replaced, whatever broke its rebuild, so that a replacement
+// never lands on the node of the replica it replaces.
+func (s *TestSuite) TestReplenishReplicasDoesNotReplaceReusableReplicaWhileRetriesRemain(c *C) {
+	vc, v, e, rs, failedReplica := setupReplenishReplicasTestInfra(c, longhorn.ReplicaConditionReasonRebuildFailedGeneral)
+
+	err := vc.replenishReplicas(v, e, rs, "")
+	c.Assert(err, IsNil)
+
+	c.Assert(rs, HasLen, 2)
+	c.Assert(rs[failedReplica.Name], NotNil)
+}
+
+// A data path that keeps breaking on a ready node must not be retried forever.
+func (s *TestSuite) TestReplenishReplicasCreatesReplacementWhenReuseRetriesAreExhausted(c *C) {
+	vc, v, e, rs, failedReplica := setupReplenishReplicasTestInfra(c, longhorn.ReplicaConditionReasonRebuildFailedDisconnection)
+	failedReplica.Spec.RebuildRetryCount = scheduler.FailedReplicaMaxRetryCount
+
+	err := vc.replenishReplicas(v, e, rs, "")
+	c.Assert(err, IsNil)
+
+	c.Assert(rs, HasLen, 3)
+}
+
+// Reusing a replica must bound connectivity failures, otherwise the retry count never grows.
+func (s *TestSuite) TestReplenishReplicasCountsRetryWhenReusingReplicaFailedByNetwork(c *C) {
+	vc, v, e, rs, failedReplica := setupReplenishReplicasTestInfra(c, longhorn.ReplicaConditionReasonRebuildFailedDisconnection)
+	vc.backoff.DeleteEntry(failedReplica.Name)
+
+	err := vc.replenishReplicas(v, e, rs, "")
+	c.Assert(err, IsNil)
+
+	c.Assert(rs, HasLen, 2)
+	c.Assert(failedReplica.Spec.FailedAt, Equals, "")
+	c.Assert(failedReplica.Spec.RebuildRetryCount, Equals, 1)
 }
 
 func (s *TestSuite) TestReconcileEngineReplicaStateV1CanRecoverFromFaultedRobustness(c *C) {
@@ -2373,7 +2939,7 @@ func (s *TestSuite) TestCleanupAutoBalancedReplicasSkipsUnstableNodeIfItWorsensB
 		c.Assert(informerFactories.KubeInformerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node), IsNil)
 	}
 
-	ds := datastore.NewDataStore(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
+	ds := datastore.NewDataStoreForGlobal(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
 	vc := &VolumeController{
 		baseController: newBaseController("test-volume", logrus.StandardLogger()),
 		ds:             ds,

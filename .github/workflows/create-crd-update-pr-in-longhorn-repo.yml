@@ -19,14 +19,18 @@ on:
         default: 'master'
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   create-pull-request:
+    timeout-minutes: 60
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Prepare Helm
         run: |
-          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
           chmod 700 get_helm.sh
           ./get_helm.sh
 
