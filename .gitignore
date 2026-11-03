@@ -37,3 +37,6 @@ validate.done
 # editors
 .idea
 
+# Local Superpowers plans, specs, reviews, and session files
+.superpowers/
+superpowers/
