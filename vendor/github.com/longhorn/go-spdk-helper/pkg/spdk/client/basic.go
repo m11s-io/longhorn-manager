@@ -991,8 +991,10 @@ func (c *Client) BdevRaidGrowBaseBdev(raidName, baseBdevName string) (growed boo
 // "fastIOFailTimeoutSec": Fast I/O failure timeout in seconds
 //
 // "multipath": Multipathing behavior: disable, failover, multipath. Default is failover
+//
+// "hostNQN": Optional. NQN this initiator presents to the target. SPDK generates one if it is empty.
 func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, trtype spdktypes.NvmeTransportType, adrfam spdktypes.NvmeAddressFamily,
-	ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath string) (bdevNameList []string, err error) {
+	ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath, hostNQN string) (bdevNameList []string, err error) {
 	req := spdktypes.BdevNvmeAttachControllerRequest{
 		Name: name,
 		NvmeTransportID: spdktypes.NvmeTransportID{
@@ -1002,6 +1004,7 @@ func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, 
 			Trsvcid: trsvcid,
 			Adrfam:  adrfam,
 		},
+		Hostnqn:              hostNQN,
 		CtrlrLossTimeoutSec:  ctrlrLossTimeoutSec,
 		ReconnectDelaySec:    reconnectDelaySec,
 		FastIOFailTimeoutSec: fastIOFailTimeoutSec,
@@ -1064,6 +1067,34 @@ func (c *Client) BdevNvmeGetControllers(name string) (controllerInfoList []spdkt
 	}
 
 	return controllerInfoList, json.Unmarshal(cmdOutput, &controllerInfoList)
+}
+
+// BdevNvmeGetIoPaths gets I/O paths of active NVMe bdevs. An I/O path is the
+// pairing of a namespace bdev with one controller's I/O qpair on one poll group
+// thread. A bdev has multiple I/O paths when it is attached through multiple
+// controllers (multipath) or used by multiple poll group threads.
+//
+//	"name": Optional. Name of the namespace bdev, e.g. "Nvme0n1". If this is not
+//	        specified, the function will list I/O paths of all NVMe bdevs.
+//	        Note that this is not the controller name ("Nvme0"). A controller
+//	        name matches nothing: every poll group is still returned, each
+//	        with an empty io_paths list, and there is no error.
+func (c *Client) BdevNvmeGetIoPaths(name string) (pollGroups []spdktypes.BdevNvmePollGroupIoPaths, err error) {
+	req := spdktypes.BdevNvmeGetIoPathsRequest{
+		Name: name,
+	}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_nvme_get_io_paths", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp spdktypes.BdevNvmeGetIoPathsResponse
+	if err := json.Unmarshal(cmdOutput, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp.PollGroups, nil
 }
 
 // BdevNvmeGetControllerHealthInfo retrieves health information for a specified
@@ -1201,10 +1232,13 @@ func (c *Client) NvmfGetTransports(trtype spdktypes.NvmeTransportType, tgtName s
 // NvmfCreateSubsystem constructs an NVMe over Fabrics target subsystem..
 //
 //	"nqn": Required. Subsystem NQN.
-func (c *Client) NvmfCreateSubsystem(nqn string) (created bool, err error) {
+//
+//	"allowAnyHost": Required. If false, only host NQNs added via NvmfSubsystemAddHost can
+//	                connect, and the subsystem is hidden from the discovery log page of other hosts.
+func (c *Client) NvmfCreateSubsystem(nqn string, allowAnyHost bool) (created bool, err error) {
 	req := spdktypes.NvmfCreateSubsystemRequest{
 		Nqn:          nqn,
-		AllowAnyHost: true,
+		AllowAnyHost: allowAnyHost,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("nvmf_create_subsystem", req)
@@ -1236,6 +1270,26 @@ func (c *Client) NvmfCreateSubsystemWithCntlid(nqn string, minCntlid, maxCntlid 
 	}
 
 	return created, json.Unmarshal(cmdOutput, &created)
+}
+
+// NvmfSubsystemAddHost adds a host NQN to the allowed list of an NVMe-oF target subsystem.
+// It takes effect only if the subsystem is created with allowAnyHost being false.
+//
+//	"nqn": Required. Subsystem NQN.
+//
+//	"hostNQN": Required. The host NQN allowed to connect to the subsystem.
+func (c *Client) NvmfSubsystemAddHost(nqn, hostNQN string) (added bool, err error) {
+	req := spdktypes.NvmfSubsystemAddHostRequest{
+		Nqn:  nqn,
+		Host: hostNQN,
+	}
+
+	cmdOutput, err := c.jsonCli.SendCommand("nvmf_subsystem_add_host", req)
+	if err != nil {
+		return false, err
+	}
+
+	return added, json.Unmarshal(cmdOutput, &added)
 }
 
 // NvmfDeleteSubsystem constructs an NVMe over Fabrics target subsystem..
